@@ -456,6 +456,7 @@ public:
       else {
         std::shared_ptr<DownloadResult> dr = group->createDownloadResult();
         e_->getRequestGroupMan()->addDownloadResult(dr);
+        rpc::fxMergeOnGroupStopped(group, e_, dr->result);
         executeStopHook(group, e_->getOption(), dr->result);
         group->releaseRuntimeResource(e_);
       }

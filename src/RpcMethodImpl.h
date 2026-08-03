@@ -136,6 +136,33 @@ public:
   static const char* getMethodName() { return "aria2.addUri"; }
 };
 
+class FxplayerAddMergeRpcMethod : public RpcMethod {
+protected:
+  virtual std::unique_ptr<ValueBase> process(const RpcRequest& req,
+                                             DownloadEngine* e) CXX11_OVERRIDE;
+
+public:
+  static const char* getMethodName() { return "fxplayer.addMerge"; }
+};
+
+class FxplayerRetryMergeRpcMethod : public RpcMethod {
+protected:
+  virtual std::unique_ptr<ValueBase> process(const RpcRequest& req,
+                                             DownloadEngine* e) CXX11_OVERRIDE;
+
+public:
+  static const char* getMethodName() { return "fxplayer.retryMerge"; }
+};
+
+class FxplayerFindMergeByOutputRpcMethod : public RpcMethod {
+protected:
+  virtual std::unique_ptr<ValueBase> process(const RpcRequest& req,
+                                             DownloadEngine* e) CXX11_OVERRIDE;
+
+public:
+  static const char* getMethodName() { return "fxplayer.findMergeByOutput"; }
+};
+
 class RemoveRpcMethod : public RpcMethod {
 protected:
   virtual std::unique_ptr<ValueBase> process(const RpcRequest& req,
@@ -571,6 +598,11 @@ void gatherProgressCommon(Dict* entryDict,
 // Helper function to store BitTorrent metadata from torrentAttrs.
 void gatherBitTorrentMetadata(Dict* btDict, TorrentAttribute* torrentAttrs);
 #endif // ENABLE_BITTORRENT
+
+// Called when one RequestGroup transitions to stopped state, so fx merge jobs
+// can advance their stage machine and run merge/remux completion logic.
+void fxMergeOnGroupStopped(const std::shared_ptr<RequestGroup>& group,
+                           DownloadEngine* e, error_code::Value result);
 
 } // namespace rpc
 

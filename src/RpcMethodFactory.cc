@@ -52,6 +52,9 @@ std::unique_ptr<RpcMethod> noSuchRpcMethod;
 namespace {
 std::vector<std::string> rpcMethodNames = {
     "aria2.addUri",
+  "fxplayer.addMerge",
+  "fxplayer.retryMerge",
+  "fxplayer.findMergeByOutput",
 #ifdef ENABLE_BITTORRENT
     "aria2.addTorrent",
     "aria2.getPeers",
@@ -117,6 +120,18 @@ std::unique_ptr<RpcMethod> createMethod(const std::string& methodName)
 {
   if (methodName == AddUriRpcMethod::getMethodName()) {
     return make_unique<AddUriRpcMethod>();
+  }
+
+  if (methodName == FxplayerAddMergeRpcMethod::getMethodName()) {
+    return make_unique<FxplayerAddMergeRpcMethod>();
+  }
+
+  if (methodName == FxplayerRetryMergeRpcMethod::getMethodName()) {
+    return make_unique<FxplayerRetryMergeRpcMethod>();
+  }
+
+  if (methodName == FxplayerFindMergeByOutputRpcMethod::getMethodName()) {
+    return make_unique<FxplayerFindMergeByOutputRpcMethod>();
   }
 
 #ifdef ENABLE_BITTORRENT

@@ -37,6 +37,18 @@
 #include <cassert>
 #include <algorithm>
 #include <sstream>
+#include <fstream>
+#include <map>
+#include <ctime>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <dirent.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <errno.h>
+#include <signal.h>
+#include <fcntl.h>
 
 #include "Logger.h"
 #include "LogFactory.h"
@@ -147,6 +159,901 @@ const char KEY_NUM_ACTIVE[] = "numActive";
 const char KEY_NUM_STOPPED_TOTAL[] = "numStoppedTotal";
 const char KEY_VERIFIED_LENGTH[] = "verifiedLength";
 const char KEY_VERIFY_PENDING[] = "verifyIntegrityPending";
+const char KEY_MERGE[] = "merge";
+} // namespace
+
+namespace {
+enum FxMergeState {
+  FX_MERGE_QUEUED = 0,
+  FX_MERGE_DOWNLOADING = 1,
+  FX_MERGE_MERGING = 2,
+  FX_MERGE_MERGED = 3,
+  FX_MERGE_FAILED = 4,
+};
+
+struct FxMergeJob {
+  a2_gid_t parentGid = 0;
+  std::vector<a2_gid_t> childGids;
+  std::vector<std::string> segmentPaths;
+  std::map<a2_gid_t, std::string> childPath;
+  std::map<a2_gid_t, bool> childDone;
+  std::map<a2_gid_t, bool> childOK;
+  std::string outputPath;
+  std::string tmpDir;
+  std::string mode = "concat";
+  bool remux = false;
+  FxMergeState state = FX_MERGE_QUEUED;
+  int errorCode = 0;
+  std::string errorMessage;
+  double mergeProgress = 0.0;
+  bool cleanupPending = false;
+  bool cleanupDone = false;
+  bool cancelRequested = false;
+  std::time_t terminalEpochSec = 0;
+};
+
+std::map<a2_gid_t, FxMergeJob> fxMergeJobs;
+std::map<a2_gid_t, a2_gid_t> fxMergeChildToParent;
+std::map<std::string, a2_gid_t> fxMergeOutputOwner;
+
+const int FX_MERGE_ERR_SEGMENT = 2000;
+const int FX_MERGE_ERR_CONCAT_IO = 2001;
+const int FX_MERGE_ERR_REMUX = 2002;
+const int FX_MERGE_ERR_RENAME = 2003;
+const int FX_MERGE_ERR_PATH = 2004;
+const int FX_MERGE_ERR_INIT = 2005;
+const int FX_MERGE_ERR_CANCELED = 2007;
+
+const std::time_t FX_MERGE_JOB_TTL_SECONDS = 30 * 60;
+
+const char* fxMergeStateName(FxMergeState state)
+{
+  switch (state) {
+  case FX_MERGE_QUEUED:
+    return "queued";
+  case FX_MERGE_DOWNLOADING:
+    return "downloading";
+  case FX_MERGE_MERGING:
+    return "merging";
+  case FX_MERGE_MERGED:
+    return "merged";
+  case FX_MERGE_FAILED:
+  default:
+    return "failed";
+  }
+}
+
+bool fxIsTerminalState(FxMergeState state)
+{
+  return state == FX_MERGE_MERGED || state == FX_MERGE_FAILED;
+}
+
+std::string fxMergeOperationFromOutputPath(const std::string& outputPath)
+{
+  auto lower = util::toLower(outputPath);
+  if (util::endsWith(lower, ".trailer.mp4")) {
+    return "download trailer";
+  }
+  if (util::endsWith(lower, ".jpg") || util::endsWith(lower, ".jpeg") ||
+      util::endsWith(lower, ".png") || util::endsWith(lower, ".webp")) {
+    return "download thumbnail";
+  }
+  return "download video";
+}
+
+void fxSetTerminalNow(FxMergeJob& job)
+{
+  if (job.terminalEpochSec == 0) {
+    job.terminalEpochSec = std::time(nullptr);
+  }
+}
+
+void fxEraseMergeJob(a2_gid_t parentGid)
+{
+  auto it = fxMergeJobs.find(parentGid);
+  if (it == fxMergeJobs.end()) {
+    return;
+  }
+
+  const auto& job = it->second;
+  for (auto gid : job.childGids) {
+    fxMergeChildToParent.erase(gid);
+  }
+
+  auto outIt = fxMergeOutputOwner.find(job.outputPath);
+  if (outIt != fxMergeOutputOwner.end() && outIt->second == parentGid) {
+    fxMergeOutputOwner.erase(outIt);
+  }
+
+  fxMergeJobs.erase(it);
+}
+
+void fxPruneExpiredMergeJobs()
+{
+  const auto now = std::time(nullptr);
+  std::vector<a2_gid_t> expired;
+  for (const auto& kv : fxMergeJobs) {
+    const auto& job = kv.second;
+    if (!fxIsTerminalState(job.state) || job.terminalEpochSec == 0) {
+      continue;
+    }
+    if ((now - job.terminalEpochSec) >= FX_MERGE_JOB_TTL_SECONDS) {
+      expired.push_back(kv.first);
+    }
+  }
+
+  for (auto gid : expired) {
+    A2_LOG_INFO(fmt("[fxmerge] evict terminal job parent=%s",
+                    GroupId::toHex(gid).c_str()));
+    fxEraseMergeJob(gid);
+  }
+}
+
+std::string fxShellQuote(const std::string& s)
+{
+  std::string out = "'";
+  for (char c : s) {
+    if (c == '\'') {
+      out += "'\\''";
+    }
+    else {
+      out += c;
+    }
+  }
+  out += "'";
+  return out;
+}
+
+std::string fxZeroPadIndex(size_t index)
+{
+  return fmt("%08lu", static_cast<unsigned long>(index));
+}
+
+const String* getStringField(const Dict* dict, const char* key)
+{
+  if (!dict) {
+    return nullptr;
+  }
+  return downcast<String>(dict->get(key));
+}
+
+const Integer* getIntegerField(const Dict* dict, const char* key)
+{
+  if (!dict) {
+    return nullptr;
+  }
+  return downcast<Integer>(dict->get(key));
+}
+
+std::string getHeadersFieldAsOptionValue(const Dict* dict, const char* key)
+{
+  if (!dict) {
+    return "";
+  }
+  auto value = dict->get(key);
+  if (!value) {
+    return "";
+  }
+
+  if (const auto* s = downcast<String>(value)) {
+    return s->s();
+  }
+
+  const auto* list = downcast<List>(value);
+  if (!list) {
+    return "";
+  }
+
+  std::string joined;
+  for (const auto& elem : *list) {
+    const auto* s = downcast<String>(elem);
+    if (!s) {
+      continue;
+    }
+    const auto& line = s->s();
+    if (line.empty()) {
+      continue;
+    }
+    if (!joined.empty()) {
+      joined += "\n";
+    }
+    joined += line;
+  }
+  return joined;
+}
+
+bool getBoolField(const Dict* dict, const char* key, bool defval)
+{
+  if (!dict) {
+    return defval;
+  }
+  if (const auto* b = downcast<Bool>(dict->get(key))) {
+    return b->val();
+  }
+  if (const auto* s = downcast<String>(dict->get(key))) {
+    auto t = s->s();
+    util::lowercase(t);
+    return t == "true" || t == "1";
+  }
+  return defval;
+}
+
+bool fxAllChildrenDone(const FxMergeJob& job)
+{
+  for (auto gid : job.childGids) {
+    auto itr = job.childDone.find(gid);
+    if (itr == job.childDone.end() || !itr->second) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool fxAnyChildFailed(const FxMergeJob& job)
+{
+  for (auto gid : job.childGids) {
+    auto itr = job.childOK.find(gid);
+    if (itr != job.childOK.end() && !itr->second) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool fxCollectPendingAria2Sidecars(const std::string& dir,
+                                   std::vector<std::string>& pending,
+                                   std::string& err)
+{
+  DIR* d = opendir(dir.c_str());
+  if (!d) {
+    err = fmt("could not open segments directory: %s errno=%d", dir.c_str(),
+              errno);
+    return false;
+  }
+
+  while (auto* entry = readdir(d)) {
+    const char* name = entry->d_name;
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+      continue;
+    }
+
+    std::string base(name);
+    if (!util::endsWith(base, ".aria2")) {
+      continue;
+    }
+    pending.push_back(base);
+  }
+
+  closedir(d);
+  return true;
+}
+
+bool fxSegmentsReadyForFinalize(FxMergeJob& job, std::string& err)
+{
+  std::vector<std::string> pendingSidecars;
+  if (!fxCollectPendingAria2Sidecars(job.tmpDir, pendingSidecars, err)) {
+    return false;
+  }
+  if (!pendingSidecars.empty()) {
+    std::ostringstream oss;
+    const auto sampleCount = std::min<size_t>(pendingSidecars.size(), 3);
+    for (size_t i = 0; i < sampleCount; ++i) {
+      if (i != 0) {
+        oss << ", ";
+      }
+      oss << pendingSidecars[i];
+    }
+    err = fmt("segment sidecars still present (%lu), e.g. %s",
+              static_cast<unsigned long>(pendingSidecars.size()),
+              oss.str().c_str());
+    return false;
+  }
+
+  return true;
+}
+
+bool fxWaitForSegmentsReady(FxMergeJob& job, std::string& err)
+{
+  // aria2 may still be finalizing segment files after child-stop callbacks fire.
+  const size_t maxAttempts = 120; // ~6 seconds at 50ms interval
+  std::string lastErr;
+
+  for (size_t attempt = 0; attempt < maxAttempts; ++attempt) {
+    if (job.cancelRequested) {
+      err = "merge canceled by user";
+      return false;
+    }
+
+    if (fxSegmentsReadyForFinalize(job, lastErr)) {
+      return true;
+    }
+
+    if (attempt == 0 || (attempt + 1) == maxAttempts || (attempt % 20) == 19) {
+      A2_LOG_WARN(fmt("[fxmerge] parent=%s waiting for segment finalization attempt=%lu/%lu reason=%s",
+                      GroupId::toHex(job.parentGid).c_str(),
+                      static_cast<unsigned long>(attempt + 1),
+                      static_cast<unsigned long>(maxAttempts),
+                      lastErr.c_str()));
+    }
+    usleep(50000);
+  }
+
+  err = lastErr.empty() ? "segment files not fully finalized" : lastErr;
+  return false;
+}
+
+bool fxRemoveTree(const std::string& path)
+{
+  File file(path);
+  if (file.isFile()) {
+    return file.remove();
+  }
+  if (!file.isDir()) {
+    return true;
+  }
+
+  DIR* dir = opendir(path.c_str());
+  if (!dir) {
+    return false;
+  }
+
+  bool ok = true;
+  while (auto* entry = readdir(dir)) {
+    const char* name = entry->d_name;
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+      continue;
+    }
+    if (!fxRemoveTree(util::applyDir(path, name))) {
+      ok = false;
+    }
+  }
+  closedir(dir);
+
+  if (!file.remove()) {
+    ok = false;
+  }
+  return ok;
+}
+
+std::string fxMergePartPath(const FxMergeJob& job)
+{
+  return util::applyDir(job.tmpDir, ".fxmerge-output.part");
+}
+
+void fxMarkFailed(FxMergeJob& job, int code, const std::string& msg,
+                  bool cleanupPending = false)
+{
+  job.state = FX_MERGE_FAILED;
+  job.errorCode = code;
+  job.errorMessage = msg;
+  job.cleanupPending = cleanupPending;
+  fxSetTerminalNow(job);
+  A2_LOG_ERROR(fmt("[fxmerge] parent=%s failed code=%d message=%s",
+                   GroupId::toHex(job.parentGid).c_str(), code,
+                   msg.c_str()));
+}
+
+void fxCleanupFailureArtifacts(FxMergeJob& job)
+{
+  if (job.cleanupDone) {
+    return;
+  }
+  const auto listPath = util::applyDir(job.tmpDir, "ffconcat.list");
+  const auto playlistPath = util::applyDir(job.tmpDir, "remux.m3u8");
+  File(fxMergePartPath(job)).remove();
+  File(job.outputPath + ".part").remove();
+  File(listPath).remove();
+  File(playlistPath).remove();
+  for (const auto& segmentPath : job.segmentPaths) {
+    File(segmentPath).remove();
+  }
+  fxRemoveTree(job.tmpDir);
+  A2_LOG_WARN(fmt("[fxmerge] parent=%s cleanup complete tmpDir=%s",
+                  GroupId::toHex(job.parentGid).c_str(), job.tmpDir.c_str()));
+  job.cleanupDone = true;
+}
+
+bool fxConcatSegments(FxMergeJob& job, const std::string& partPath,
+                      std::string& err)
+{
+  std::ofstream out(partPath.c_str(), std::ios::binary | std::ios::trunc);
+  if (!out) {
+    err = "could not open part file for writing";
+    return false;
+  }
+
+  const auto totalSegments = job.segmentPaths.size();
+  size_t idx = 0;
+  for (const auto& segmentPath : job.segmentPaths) {
+    if (job.cancelRequested) {
+      err = "merge canceled by user";
+      return false;
+    }
+
+    std::ifstream in(segmentPath.c_str(), std::ios::binary);
+    if (!in) {
+      err = fmt("could not open segment: %s", segmentPath.c_str());
+      return false;
+    }
+    out << in.rdbuf();
+    if (!out) {
+      err = fmt("write failed while concatenating: %s", segmentPath.c_str());
+      return false;
+    }
+
+    ++idx;
+    if (totalSegments > 0) {
+      job.mergeProgress = static_cast<double>(idx) /
+                          static_cast<double>(totalSegments);
+    }
+  }
+  out.flush();
+  if (!out) {
+    err = "flush failed for part file";
+    return false;
+  }
+  return true;
+}
+
+bool fxSyncFile(const std::string& path, std::string& err)
+{
+  int fd = open(path.c_str(), O_RDONLY);
+  if (fd == -1) {
+    err = fmt("failed to open for fsync: %s errno=%d", path.c_str(), errno);
+    return false;
+  }
+  if (fsync(fd) != 0) {
+    int e = errno;
+    close(fd);
+    err = fmt("failed to fsync file: %s errno=%d", path.c_str(), e);
+    return false;
+  }
+  close(fd);
+  return true;
+}
+
+bool fxSyncDir(const std::string& path, std::string& err)
+{
+  int fd = open(path.c_str(), O_RDONLY);
+  if (fd == -1) {
+    err = fmt("failed to open dir for fsync: %s errno=%d", path.c_str(), errno);
+    return false;
+  }
+  if (fsync(fd) != 0) {
+    int e = errno;
+    close(fd);
+    err = fmt("failed to fsync dir: %s errno=%d", path.c_str(), e);
+    return false;
+  }
+  close(fd);
+  return true;
+}
+
+bool fxRemuxSegments(FxMergeJob& job, const std::string& partPath,
+                     std::string& err)
+{
+  const auto listPath = util::applyDir(job.tmpDir, "remux.m3u8");
+  const auto concatListPath = util::applyDir(job.tmpDir, "concat.list");
+  const auto lowerOutput = util::toLower(job.outputPath);
+  const bool outputMpegTs = util::endsWith(lowerOutput, ".ts");
+  const bool isTsSegmentBundle = !job.segmentPaths.empty() &&
+                                util::endsWith(util::toLower(File(job.segmentPaths.front()).getBasename()), ".ts");
+
+  bool hasInitSegment = false;
+  size_t mediaStartIndex = 0;
+
+  if (!job.segmentPaths.empty()) {
+    const auto& firstPath = job.segmentPaths.front();
+    const auto lowerFirst = util::toLower(File(firstPath).getBasename());
+    if (job.segmentPaths.size() > 1 &&
+        (util::endsWith(lowerFirst, ".mp4") ||
+         util::endsWith(lowerFirst, ".m4s") ||
+         lowerFirst.find("init") != std::string::npos)) {
+      hasInitSegment = true;
+      mediaStartIndex = 1;
+    }
+  }
+
+  if (isTsSegmentBundle && outputMpegTs) {
+    std::ofstream concatList(concatListPath.c_str(), std::ios::binary | std::ios::trunc);
+    if (!concatList) {
+      err = "could not write ffmpeg concat list";
+      return false;
+    }
+    for (const auto& segmentPath : job.segmentPaths) {
+      concatList << "file '" << segmentPath << "'\n";
+    }
+    concatList.flush();
+  }
+  else {
+    std::ofstream list(listPath.c_str(), std::ios::binary | std::ios::trunc);
+    if (!list) {
+      err = "could not write ffmpeg hls playlist";
+      return false;
+    }
+
+    list << "#EXTM3U\n";
+    list << "#EXT-X-VERSION:7\n";
+    list << "#EXT-X-TARGETDURATION:1\n";
+    list << "#EXT-X-MEDIA-SEQUENCE:0\n";
+    list << "#EXT-X-PLAYLIST-TYPE:VOD\n";
+    if (hasInitSegment) {
+      list << "#EXT-X-MAP:URI=\""
+           << File(job.segmentPaths.front()).getBasename() << "\"\n";
+    }
+    for (size_t i = mediaStartIndex; i < job.segmentPaths.size(); ++i) {
+      list << "#EXTINF:1.0,\n";
+      list << File(job.segmentPaths[i]).getBasename() << "\n";
+    }
+    list << "#EXT-X-ENDLIST\n";
+    list.flush();
+  }
+
+  A2_LOG_WARN(fmt("[fxmerge] parent=%s remux command start",
+                  GroupId::toHex(job.parentGid).c_str()));
+
+  // aria2 may run with SIGCHLD ignored; temporarily restore default so waitpid works.
+  struct sigaction oldAct;
+  struct sigaction dflAct;
+  memset(&dflAct, 0, sizeof(dflAct));
+  dflAct.sa_handler = SIG_DFL;
+  sigemptyset(&dflAct.sa_mask);
+  if (sigaction(SIGCHLD, &dflAct, &oldAct) != 0) {
+    err = fmt("failed to configure SIGCHLD for ffmpeg: errno=%d", errno);
+    return false;
+  }
+
+  int errPipe[2] = {-1, -1};
+  if (pipe(errPipe) != 0) {
+    int e = errno;
+    sigaction(SIGCHLD, &oldAct, nullptr);
+    err = fmt("failed to create ffmpeg error pipe: errno=%d", e);
+    return false;
+  }
+  fcntl(errPipe[1], F_SETFD, FD_CLOEXEC);
+  fcntl(errPipe[0], F_SETFL, O_NONBLOCK);
+
+  pid_t cpid = fork();
+  if (cpid == -1) {
+    int e = errno;
+    close(errPipe[0]);
+    close(errPipe[1]);
+    sigaction(SIGCHLD, &oldAct, nullptr);
+    err = fmt("failed to fork ffmpeg process: errno=%d", e);
+    return false;
+  }
+
+  if (cpid == 0) {
+    close(errPipe[0]);
+    dup2(errPipe[1], STDERR_FILENO);
+    const char* ffmpegBins[] = {"ffmpeg", "/usr/local/bin/ffmpeg",
+                                "/usr/bin/ffmpeg", nullptr};
+    const auto lowerOutput = util::toLower(job.outputPath);
+    const bool outputMpegTs = util::endsWith(lowerOutput, ".ts");
+    for (size_t i = 0; ffmpegBins[i]; ++i) {
+      if (isTsSegmentBundle && outputMpegTs) {
+        execl(ffmpegBins[i], ffmpegBins[i], "-y", "-hide_banner", "-loglevel",
+              "error", "-xerror", "-err_detect",
+              "crccheck+bitstream+buffer+explode", "-f", "concat", "-safe",
+              "0", "-i", concatListPath.c_str(), "-c", "copy", "-f",
+              "mpegts", partPath.c_str(), static_cast<char*>(nullptr));
+      }
+      else if (outputMpegTs) {
+        execl(ffmpegBins[i], ffmpegBins[i], "-y", "-hide_banner", "-loglevel",
+              "error", "-xerror", "-err_detect",
+              "crccheck+bitstream+buffer+explode", "-allowed_extensions", "ALL",
+              "-allowed_segment_extensions", "ALL", "-extension_picky", "0",
+              "-protocol_whitelist", "file,crypto,data,http,https,tcp,tls", "-f",
+              "hls", "-i", listPath.c_str(), "-fflags", "+genpts",
+              "-reset_timestamps", "1", "-c", "copy", "-f", "mpegts",
+              partPath.c_str(), static_cast<char*>(nullptr));
+      }
+      else {
+        execl(ffmpegBins[i], ffmpegBins[i], "-y", "-hide_banner", "-loglevel",
+              "error", "-xerror", "-err_detect",
+              "crccheck+bitstream+buffer+explode", "-allowed_extensions", "ALL",
+              "-allowed_segment_extensions", "ALL", "-extension_picky", "0",
+              "-protocol_whitelist", "file,crypto,data,http,https,tcp,tls", "-f",
+              "hls", "-i", listPath.c_str(), "-fflags", "+genpts",
+              "-reset_timestamps", "1", "-c", "copy", "-movflags",
+              "+faststart", "-f", "mp4", partPath.c_str(),
+              static_cast<char*>(nullptr));
+      }
+      if (errno != ENOENT) {
+        break;
+      }
+    }
+    std::string execErr = fmt("failed to exec ffmpeg: errno=%d\n", errno);
+    (void)::write(errPipe[1], execErr.c_str(), execErr.size());
+    close(errPipe[1]);
+    _exit(127);
+  }
+
+  close(errPipe[1]);
+
+  int status = 0;
+  std::string ffmpegStderr;
+  auto drainFfmpegStderr = [&ffmpegStderr, &errPipe]() {
+    char buf[1024];
+    while (true) {
+      ssize_t nread = ::read(errPipe[0], buf, sizeof(buf));
+      if (nread > 0) {
+        ffmpegStderr.append(buf, static_cast<size_t>(nread));
+        continue;
+      }
+      if (nread == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        break;
+      }
+      if (nread <= 0) {
+        break;
+      }
+    }
+  };
+  auto drainFfmpegStderrUntilEof = [&ffmpegStderr, &errPipe]() {
+    char buf[1024];
+    while (true) {
+      ssize_t nread = ::read(errPipe[0], buf, sizeof(buf));
+      if (nread > 0) {
+        ffmpegStderr.append(buf, static_cast<size_t>(nread));
+        continue;
+      }
+      if (nread == 0) {
+        break;
+      }
+      if (errno == EINTR) {
+        continue;
+      }
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        continue;
+      }
+      break;
+    }
+  };
+  while (true) {
+    pid_t w = waitpid(cpid, &status, WNOHANG);
+    if (w == cpid) {
+      drainFfmpegStderr();
+      break;
+    }
+    if (w == 0) {
+      drainFfmpegStderr();
+      if (job.cancelRequested) {
+        kill(cpid, SIGTERM);
+        for (size_t i = 0; i < 20; ++i) {
+          w = waitpid(cpid, &status, WNOHANG);
+          if (w == cpid) {
+            drainFfmpegStderr();
+            break;
+          }
+          drainFfmpegStderr();
+          usleep(50000);
+        }
+        if (w == 0) {
+          kill(cpid, SIGKILL);
+          (void)waitpid(cpid, &status, 0);
+          drainFfmpegStderr();
+        }
+
+        close(errPipe[0]);
+        sigaction(SIGCHLD, &oldAct, nullptr);
+        err = "merge canceled by user";
+        return false;
+      }
+
+      usleep(50000);
+      continue;
+    }
+    if (w == -1) {
+      if (errno == EINTR) {
+        drainFfmpegStderr();
+        continue;
+      }
+      int e = errno;
+      close(errPipe[0]);
+      sigaction(SIGCHLD, &oldAct, nullptr);
+      err = fmt("waitpid failed for ffmpeg: errno=%d", e);
+      return false;
+    }
+  }
+  sigaction(SIGCHLD, &oldAct, nullptr);
+
+  int flags = fcntl(errPipe[0], F_GETFL, 0);
+  if (flags != -1) {
+    fcntl(errPipe[0], F_SETFL, flags & ~O_NONBLOCK);
+  }
+  drainFfmpegStderrUntilEof();
+  close(errPipe[0]);
+
+  if (!WIFEXITED(status)) {
+    err = "ffmpeg terminated abnormally";
+    return false;
+  }
+
+  int exitCode = WEXITSTATUS(status);
+  if (exitCode != 0) {
+    while (!ffmpegStderr.empty() &&
+           (ffmpegStderr.back() == '\n' || ffmpegStderr.back() == '\r')) {
+      ffmpegStderr.pop_back();
+    }
+    if (!ffmpegStderr.empty()) {
+      A2_LOG_ERROR(fmt("[fxmerge] parent=%s ffmpeg stderr: %s",
+                       GroupId::toHex(job.parentGid).c_str(),
+                       ffmpegStderr.c_str()));
+      err = fmt("ffmpeg exited with code %d: %s", exitCode,
+                ffmpegStderr.c_str());
+    }
+    else {
+      A2_LOG_ERROR(fmt("[fxmerge] parent=%s ffmpeg stderr: <empty>",
+                       GroupId::toHex(job.parentGid).c_str()));
+      err = fmt("ffmpeg exited with code %d", exitCode);
+    }
+    return false;
+  }
+  File(listPath).remove();
+  return true;
+}
+
+bool fxFinalizeMerge(FxMergeJob& job)
+{
+  if (job.cancelRequested) {
+    fxMarkFailed(job, FX_MERGE_ERR_CANCELED, "merge canceled by user", true);
+    return false;
+  }
+
+  std::string preflightErr;
+  if (!fxWaitForSegmentsReady(job, preflightErr)) {
+    if (job.cancelRequested || preflightErr == "merge canceled by user") {
+      fxMarkFailed(job, FX_MERGE_ERR_CANCELED, "merge canceled by user", true);
+    }
+    else {
+      fxMarkFailed(job, FX_MERGE_ERR_SEGMENT, preflightErr, true);
+    }
+    return false;
+  }
+
+  job.state = FX_MERGE_MERGING;
+  job.mergeProgress = 0.0;
+  A2_LOG_WARN(fmt("[fxmerge] parent=%s finalize begin mode=%s output=%s",
+                  GroupId::toHex(job.parentGid).c_str(), job.mode.c_str(),
+                  job.outputPath.c_str()));
+
+  const auto outputDir = File(job.outputPath).getDirname();
+  if (!outputDir.empty()) {
+    File odir(outputDir);
+    if (!odir.isDir() && !odir.mkdirs()) {
+      fxMarkFailed(job, FX_MERGE_ERR_PATH,
+                   "could not create output directory");
+      return false;
+    }
+  }
+
+  const auto partPath = fxMergePartPath(job);
+  File(partPath).remove();
+
+  std::string err;
+  bool ok = false;
+  if (job.remux) {
+    for (size_t attempt = 1; attempt <= 2; ++attempt) {
+      ok = fxRemuxSegments(job, partPath, err);
+      if (!ok) {
+        break;
+      }
+
+      File partFile(partPath);
+      const int64_t partSize = partFile.size();
+      if (partFile.isFile() && partSize > 0) {
+        break;
+      }
+
+      ok = false;
+      err = fmt("ffmpeg exited successfully but remux output is missing or empty: %s",
+                partPath.c_str());
+      if (attempt == 1) {
+        A2_LOG_WARN(fmt("[fxmerge] parent=%s remux output missing after successful ffmpeg exit; retrying once path=%s size=%" PRId64,
+                        GroupId::toHex(job.parentGid).c_str(),
+                        partPath.c_str(), partSize));
+        partFile.remove();
+        err.clear();
+      }
+    }
+    if (!ok) {
+      if (job.cancelRequested || err == "merge canceled by user") {
+        fxMarkFailed(job, FX_MERGE_ERR_CANCELED, "merge canceled by user", true);
+      }
+      else {
+        fxMarkFailed(job, FX_MERGE_ERR_REMUX, err);
+      }
+      return false;
+    }
+  }
+  else {
+    ok = fxConcatSegments(job, partPath, err);
+    if (!ok) {
+      if (job.cancelRequested || err == "merge canceled by user") {
+        fxMarkFailed(job, FX_MERGE_ERR_CANCELED, "merge canceled by user", true);
+      }
+      else {
+        fxMarkFailed(job, FX_MERGE_ERR_CONCAT_IO, err);
+      }
+      return false;
+    }
+  }
+
+  if (job.cancelRequested) {
+    fxMarkFailed(job, FX_MERGE_ERR_CANCELED, "merge canceled by user", true);
+    return false;
+  }
+
+  if (!fxSyncFile(partPath, err)) {
+    fxMarkFailed(job, FX_MERGE_ERR_CONCAT_IO, err);
+    return false;
+  }
+
+  // Keep a completed remux available through a short-lived publish failure.
+  const size_t maxPublishAttempts = 100; // 10 seconds at 100ms intervals
+  int publishErrno = 0;
+  std::string publishError;
+  bool published = false;
+  for (size_t attempt = 1; attempt <= maxPublishAttempts; ++attempt) {
+    errno = 0;
+    if (File(partPath).renameTo(job.outputPath)) {
+      published = true;
+      if (attempt > 1) {
+        A2_LOG_WARN(fmt("[fxmerge] parent=%s atomic publish recovered attempt=%lu/%lu output=%s",
+                        GroupId::toHex(job.parentGid).c_str(),
+                        static_cast<unsigned long>(attempt),
+                        static_cast<unsigned long>(maxPublishAttempts),
+                        job.outputPath.c_str()));
+      }
+      break;
+    }
+    publishErrno = errno;
+    publishError = std::strerror(publishErrno);
+    if (job.cancelRequested) {
+      fxMarkFailed(job, FX_MERGE_ERR_CANCELED, "merge canceled by user", true);
+      return false;
+    }
+    if (attempt == 1 || attempt == maxPublishAttempts || attempt % 10 == 0) {
+      A2_LOG_WARN(fmt("[fxmerge] parent=%s atomic publish retry attempt=%lu/%lu errno=%d error=%s part=%s output=%s",
+                      GroupId::toHex(job.parentGid).c_str(),
+                      static_cast<unsigned long>(attempt),
+                      static_cast<unsigned long>(maxPublishAttempts),
+                            publishErrno, publishError.c_str(), partPath.c_str(),
+                            job.outputPath.c_str()));
+    }
+    usleep(100000);
+  }
+  if (!published) {
+    fxMarkFailed(job, FX_MERGE_ERR_RENAME,
+                 fmt("atomic rename from part to output failed after %lu attempts: errno=%d error=%s part=%s output=%s",
+                     static_cast<unsigned long>(maxPublishAttempts), publishErrno,
+                     publishError.c_str(), partPath.c_str(),
+                     job.outputPath.c_str()));
+    return false;
+  }
+
+  if (!outputDir.empty()) {
+    if (!fxSyncDir(outputDir, err)) {
+      fxMarkFailed(job, FX_MERGE_ERR_RENAME, err);
+      return false;
+    }
+  }
+
+  for (const auto& segmentPath : job.segmentPaths) {
+    File(segmentPath).remove();
+  }
+  fxRemoveTree(job.tmpDir);
+
+  job.state = FX_MERGE_MERGED;
+  job.errorCode = 0;
+  job.errorMessage.clear();
+  job.mergeProgress = 1.0;
+  fxSetTerminalNow(job);
+  A2_LOG_WARN(fmt("[fxmerge] parent=%s finalize complete output=%s",
+                  GroupId::toHex(job.parentGid).c_str(),
+                  job.outputPath.c_str()));
+  return true;
+}
 } // namespace
 
 namespace {
@@ -254,6 +1161,370 @@ std::unique_ptr<ValueBase> AddUriRpcMethod::process(const RpcRequest& req,
   }
   else {
     throw DL_ABORT_EX("No URI to download.");
+  }
+}
+
+std::unique_ptr<ValueBase> FxplayerAddMergeRpcMethod::process(
+    const RpcRequest& req, DownloadEngine* e)
+{
+  fxPruneExpiredMergeJobs();
+
+  const List* segmentsParam = checkRequiredParam<List>(req, 0);
+  const Dict* aria2OptsParam = checkParam<Dict>(req, 1);
+  const Dict* mergeOptsParam = checkParam<Dict>(req, 2);
+
+  std::string outputPathForLog = "<unknown>";
+  std::string tmpDirForLog = "<unknown>";
+  std::string modeForLog = "concat";
+  const auto segmentCountForLog = static_cast<unsigned long>(segmentsParam->size());
+
+  try {
+
+  const auto* outputParam = getStringField(mergeOptsParam, "output");
+  if (!outputParam || outputParam->s().empty()) {
+    throw DL_ABORT_EX("merge options must include non-empty 'output'.");
+  }
+
+  std::string outputPath = outputParam->s();
+  outputPathForLog = outputPath;
+
+  auto ownerItr = fxMergeOutputOwner.find(outputPath);
+  if (ownerItr != fxMergeOutputOwner.end()) {
+    auto existing = fxMergeJobs.find(ownerItr->second);
+    if (existing != fxMergeJobs.end()) {
+      if (existing->second.state != FX_MERGE_FAILED) {
+        A2_LOG_WARN(fmt("[fxmerge] add idempotent reuse output=%s existingParent=%s state=%s",
+                        outputPath.c_str(),
+                        GroupId::toHex(ownerItr->second).c_str(),
+                        fxMergeStateName(existing->second.state)));
+        return createGIDResponse(ownerItr->second);
+      }
+      throw DL_ABORT_EX(fmt("merge output collision: output already claimed by GID#%s state=%s",
+                            GroupId::toHex(ownerItr->second).c_str(),
+                            fxMergeStateName(existing->second.state)));
+    }
+    fxMergeOutputOwner.erase(ownerItr);
+  }
+
+  std::string tmpDir = outputPath + ".segments";
+  if (const auto* tmpParam = getStringField(mergeOptsParam, "tmpDir")) {
+    if (!tmpParam->s().empty()) {
+      tmpDir = tmpParam->s();
+    }
+  }
+  tmpDirForLog = tmpDir;
+
+  std::string mode = "concat";
+  if (const auto* modeParam = getStringField(mergeOptsParam, "mode")) {
+    mode = modeParam->s();
+    util::lowercase(mode);
+  }
+  bool remux = getBoolField(mergeOptsParam, "remux", mode == "remux");
+  if (!remux && mode == "remux") {
+    remux = true;
+  }
+  if (!remux) {
+    mode = "concat";
+  }
+  else {
+    mode = "remux";
+  }
+  modeForLog = mode;
+  const auto headersOptionValue =
+      getHeadersFieldAsOptionValue(mergeOptsParam, "headers");
+
+  // Do NOT touch tmpDir synchronously here. On SMB targets this can block JSON-RPC for
+  // tens of seconds while a spun-down drive wakes up, causing client-side submit timeouts.
+  // RequestGroup disk setup will create/use directories lazily when downloads actually start.
+
+  std::vector<std::shared_ptr<RequestGroup>> groups;
+  std::vector<std::string> segmentPaths;
+  segmentPaths.reserve(segmentsParam->size());
+
+  size_t index = 0;
+  for (auto& elem : *segmentsParam) {
+    std::string uri;
+    if (const auto* s = downcast<String>(elem)) {
+      uri = s->s();
+    }
+    else if (const auto* d = downcast<Dict>(elem)) {
+      if (const auto* u = getStringField(d, "uri")) {
+        uri = u->s();
+      }
+    }
+    if (uri.empty()) {
+      throw DL_ABORT_EX(fmt("segment at index %lu is missing uri",
+                            static_cast<unsigned long>(index)));
+    }
+
+    auto requestOption = std::make_shared<Option>(*e->getOption());
+    if (aria2OptsParam) {
+      gatherRequestOption(requestOption.get(), aria2OptsParam);
+    }
+    const auto filename = fxZeroPadIndex(index);
+    requestOption->put(PREF_DIR, tmpDir);
+    requestOption->put(PREF_OUT, filename);
+    requestOption->put(PREF_CONTINUE, "true");
+    if (!headersOptionValue.empty()) {
+      requestOption->put(PREF_HEADER, headersOptionValue);
+    }
+
+    std::vector<std::shared_ptr<RequestGroup>> created;
+    createRequestGroupForUri(created, requestOption, std::vector<std::string>{uri},
+                             /* ignoreForceSeq = */ true,
+                             /* ignoreLocalPath = */ true);
+    if (created.empty()) {
+      throw DL_ABORT_EX(fmt("could not create request group for segment %lu",
+                            static_cast<unsigned long>(index)));
+    }
+    groups.push_back(created.front());
+    segmentPaths.push_back(util::applyDir(tmpDir, filename));
+    ++index;
+  }
+
+  if (groups.empty()) {
+    throw DL_ABORT_EX("segments must contain at least one URI.");
+  }
+
+  const auto parentGid = groups.front()->getGID();
+  if (groups.size() > 1) {
+    groups.front()->followedBy(groups.begin() + 1, groups.end());
+    for (size_t i = 1; i < groups.size(); ++i) {
+      groups[i]->following(parentGid);
+      groups[i]->belongsTo(parentGid);
+    }
+  }
+
+  FxMergeJob job;
+  job.parentGid = parentGid;
+  job.outputPath = outputPath;
+  job.tmpDir = tmpDir;
+  job.mode = mode;
+  job.remux = remux;
+  job.state = FX_MERGE_DOWNLOADING;
+  job.segmentPaths = segmentPaths;
+  for (auto& g : groups) {
+    auto gid = g->getGID();
+    job.childGids.push_back(gid);
+    job.childDone[gid] = false;
+    job.childOK[gid] = true;
+    job.childPath[gid] = util::applyDir(tmpDir, fxZeroPadIndex(job.childGids.size() - 1));
+    fxMergeChildToParent[gid] = parentGid;
+  }
+  fxMergeJobs[parentGid] = job;
+  fxMergeOutputOwner[outputPath] = parentGid;
+
+  e->getRequestGroupMan()->addReservedGroup(groups);
+
+  A2_LOG_WARN(fmt("[fxmerge] add parent=%s segments=%lu mode=%s remux=%s tmpDir=%s output=%s",
+                  GroupId::toHex(parentGid).c_str(),
+                  static_cast<unsigned long>(groups.size()), mode.c_str(),
+                  remux ? "true" : "false", tmpDir.c_str(),
+                  outputPath.c_str()));
+
+  return createGIDResponse(parentGid);
+  }
+  catch (RecoverableException& ex) {
+    const auto op = fxMergeOperationFromOutputPath(outputPathForLog);
+    A2_LOG_ERROR(fmt("[fxmerge] add failed operation=%s output=%s segments=%lu mode=%s tmpDir=%s reason=%s",
+                     op.c_str(), outputPathForLog.c_str(), segmentCountForLog,
+                     modeForLog.c_str(), tmpDirForLog.c_str(), ex.what()));
+    throw DL_ABORT_EX(fmt("unable to %s with aria2: %s", op.c_str(), ex.what()));
+  }
+}
+
+std::unique_ptr<ValueBase> FxplayerRetryMergeRpcMethod::process(
+    const RpcRequest& req, DownloadEngine* e)
+{
+  fxPruneExpiredMergeJobs();
+
+  const String* gidParam = checkRequiredParam<String>(req, 0);
+  a2_gid_t gid;
+  if (GroupId::toNumericId(gid, gidParam->s().c_str()) != 0) {
+    gid = str2Gid(gidParam);
+  }
+
+  auto itr = fxMergeJobs.find(gid);
+  if (itr == fxMergeJobs.end()) {
+    throw DL_ABORT_EX(fmt("No fx merge job for GID#%s",
+                          GroupId::toHex(gid).c_str()));
+  }
+  auto& job = itr->second;
+
+  if (!fxAllChildrenDone(job)) {
+    throw DL_ABORT_EX("Cannot retry merge: some segments are still in progress.");
+  }
+  if (fxAnyChildFailed(job)) {
+    throw DL_ABORT_EX("Cannot retry merge: one or more segments failed; re-add the job to resume downloads.");
+  }
+
+  if (job.state != FX_MERGE_FAILED) {
+    throw DL_ABORT_EX(fmt("Cannot retry merge: job is in state '%s'; only failed merge jobs are retryable.",
+                          fxMergeStateName(job.state)));
+  }
+
+  job.errorCode = 0;
+  job.errorMessage.clear();
+  job.state = FX_MERGE_MERGING;
+  if (!fxFinalizeMerge(job)) {
+    if (job.cleanupPending && fxAllChildrenDone(job)) {
+      fxCleanupFailureArtifacts(job);
+    }
+    throw DL_ABORT_EX(fmt("Retry merge failed for GID#%s: %s",
+                          GroupId::toHex(gid).c_str(),
+                          job.errorMessage.c_str()));
+  }
+
+  A2_LOG_WARN(fmt("[fxmerge] retry complete parent=%s",
+                  GroupId::toHex(gid).c_str()));
+  return createOKResponse();
+}
+
+std::unique_ptr<ValueBase> FxplayerFindMergeByOutputRpcMethod::process(
+    const RpcRequest& req, DownloadEngine* e)
+{
+  (void)e;
+  fxPruneExpiredMergeJobs();
+
+  const String* outputParam = checkRequiredParam<String>(req, 0);
+  const auto outputPath = outputParam->s();
+
+  auto result = Dict::g();
+  auto ownerItr = fxMergeOutputOwner.find(outputPath);
+  if (ownerItr == fxMergeOutputOwner.end()) {
+    result->put("found", VLB_FALSE);
+    return std::move(result);
+  }
+
+  auto jobItr = fxMergeJobs.find(ownerItr->second);
+  if (jobItr == fxMergeJobs.end()) {
+    fxMergeOutputOwner.erase(ownerItr);
+    result->put("found", VLB_FALSE);
+    return std::move(result);
+  }
+
+  const auto& job = jobItr->second;
+  const bool retryable =
+      job.state == FX_MERGE_FAILED && fxAllChildrenDone(job) &&
+      !fxAnyChildFailed(job) && job.errorCode != FX_MERGE_ERR_CANCELED;
+
+  const char* outcome = "running";
+  if (job.state == FX_MERGE_MERGED) {
+    outcome = "succeeded";
+  }
+  else if (job.state == FX_MERGE_FAILED) {
+    outcome = retryable ? "retryable-failure" : "failed";
+  }
+
+  const char* status = VLB_ACTIVE;
+  if (job.state == FX_MERGE_MERGED) {
+    status = VLB_COMPLETE;
+  }
+  else if (job.state == FX_MERGE_FAILED) {
+    status = VLB_ERROR;
+  }
+
+  result->put("found", VLB_TRUE);
+  result->put("gid", GroupId::toHex(job.parentGid));
+  result->put("status", status);
+  result->put("state", fxMergeStateName(job.state));
+  result->put("stage", fxMergeStateName(job.state));
+  result->put("terminal", fxIsTerminalState(job.state) ? VLB_TRUE : VLB_FALSE);
+  result->put("retryable", retryable ? VLB_TRUE : VLB_FALSE);
+  result->put("outcome", outcome);
+  result->put("output", job.outputPath);
+  if (job.errorCode != 0) {
+    result->put("errorCode", util::itos(job.errorCode));
+  }
+  if (!job.errorMessage.empty()) {
+    result->put("errorMessage", job.errorMessage);
+  }
+  return std::move(result);
+}
+
+void fxMergeOnGroupStopped(const std::shared_ptr<RequestGroup>& group,
+                           DownloadEngine* e, error_code::Value result)
+{
+  fxPruneExpiredMergeJobs();
+
+  const auto gid = group->getGID();
+  a2_gid_t parent = 0;
+
+  auto pitr = fxMergeJobs.find(gid);
+  if (pitr != fxMergeJobs.end()) {
+    parent = gid;
+  }
+  else {
+    auto citr = fxMergeChildToParent.find(gid);
+    if (citr == fxMergeChildToParent.end()) {
+      return;
+    }
+    parent = citr->second;
+  }
+
+  auto jobItr = fxMergeJobs.find(parent);
+  if (jobItr == fxMergeJobs.end()) {
+    return;
+  }
+  auto& job = jobItr->second;
+  if (job.state == FX_MERGE_MERGED) {
+    return;
+  }
+
+  job.childDone[gid] = true;
+  const bool ok = result == error_code::FINISHED;
+  job.childOK[gid] = ok;
+
+  if (job.state == FX_MERGE_FAILED) {
+    if (job.cleanupPending && fxAllChildrenDone(job)) {
+      fxCleanupFailureArtifacts(job);
+    }
+    return;
+  }
+
+  A2_LOG_INFO(fmt("[fxmerge] child-stop parent=%s child=%s result=%d",
+                  GroupId::toHex(parent).c_str(), GroupId::toHex(gid).c_str(),
+                  static_cast<int>(result)));
+
+  if (!ok) {
+    if (job.cancelRequested) {
+      fxMarkFailed(job, FX_MERGE_ERR_CANCELED,
+                   fmt("merge canceled by user during download gid=%s code=%d",
+                       GroupId::toHex(gid).c_str(), static_cast<int>(result)),
+                   true);
+    }
+    else {
+      fxMarkFailed(
+          job, FX_MERGE_ERR_SEGMENT,
+          fmt("segment download failed gid=%s code=%d",
+              GroupId::toHex(gid).c_str(), static_cast<int>(result)),
+          true);
+    }
+    if (fxAllChildrenDone(job)) {
+      fxCleanupFailureArtifacts(job);
+    }
+    return;
+  }
+
+  if (!fxAllChildrenDone(job)) {
+    job.state = FX_MERGE_DOWNLOADING;
+    return;
+  }
+
+  if (fxAnyChildFailed(job)) {
+    fxMarkFailed(job, FX_MERGE_ERR_SEGMENT,
+                 "one or more segments failed", true);
+    fxCleanupFailureArtifacts(job);
+    return;
+  }
+
+  A2_LOG_WARN(fmt("[fxmerge] parent=%s all segments downloaded; starting merge mode=%s tmpDir=%s output=%s",
+                  GroupId::toHex(parent).c_str(), job.mode.c_str(),
+                  job.tmpDir.c_str(), job.outputPath.c_str()));
+  if (!fxFinalizeMerge(job)) {
+    if (job.cleanupPending && fxAllChildrenDone(job)) {
+      fxCleanupFailureArtifacts(job);
+    }
   }
 }
 
@@ -389,9 +1660,65 @@ namespace {
 std::unique_ptr<ValueBase> removeDownload(const RpcRequest& req,
                                           DownloadEngine* e, bool forceRemove)
 {
+  fxPruneExpiredMergeJobs();
+
   const String* gidParam = checkRequiredParam<String>(req, 0);
 
-  a2_gid_t gid = str2Gid(gidParam);
+  a2_gid_t gid;
+  if (GroupId::toNumericId(gid, gidParam->s().c_str()) != 0 ||
+      fxMergeJobs.find(gid) == fxMergeJobs.end()) {
+    gid = str2Gid(gidParam);
+  }
+
+  auto mergeItr = fxMergeJobs.find(gid);
+  if (mergeItr != fxMergeJobs.end()) {
+    auto& job = mergeItr->second;
+
+    if (fxIsTerminalState(job.state)) {
+      // Deleting a terminal merge job should always clear remaining artifacts.
+      if (job.state == FX_MERGE_FAILED) {
+        fxCleanupFailureArtifacts(job);
+      }
+      File(fxMergePartPath(job)).remove();
+      File(job.outputPath + ".part").remove();
+      if (job.state == FX_MERGE_FAILED) {
+        File(job.outputPath).remove();
+      }
+      fxEraseMergeJob(gid);
+      e->getRequestGroupMan()->removeDownloadResult(gid);
+      return createGIDResponse(gid);
+    }
+
+    job.cancelRequested = true;
+
+    bool touched = false;
+    for (auto childGid : job.childGids) {
+      auto child = e->getRequestGroupMan()->findGroup(childGid);
+      if (!child) {
+        continue;
+      }
+
+      if (child->getState() == RequestGroup::STATE_ACTIVE) {
+        if (forceRemove) {
+          child->setForceHaltRequested(true, RequestGroup::USER_REQUEST);
+        }
+        else {
+          child->setHaltRequested(true, RequestGroup::USER_REQUEST);
+        }
+        touched = true;
+      }
+      else if (child->isDependencyResolved()) {
+        e->getRequestGroupMan()->removeReservedGroup(childGid);
+        touched = true;
+      }
+    }
+
+    if (touched) {
+      e->setRefreshInterval(std::chrono::milliseconds(0));
+    }
+    return createGIDResponse(gid);
+  }
+
   auto group = e->getRequestGroupMan()->findGroup(gid);
   if (group) {
     if (group->getState() == RequestGroup::STATE_ACTIVE) {
@@ -995,15 +2322,277 @@ std::unique_ptr<ValueBase> GetPeersRpcMethod::process(const RpcRequest& req,
 }
 #endif // ENABLE_BITTORRENT
 
+namespace {
+int64_t fxMedianSample(std::vector<int64_t> samples)
+{
+  if (samples.empty()) {
+    return 0;
+  }
+
+  const size_t mid = samples.size() / 2;
+  std::nth_element(samples.begin(), samples.begin() + mid, samples.end());
+  int64_t median = samples[mid];
+  if ((samples.size() % 2) == 0) {
+    std::nth_element(samples.begin(), samples.begin() + mid - 1,
+                     samples.begin() + mid);
+    median = (median + samples[mid - 1]) / 2;
+  }
+  return median;
+}
+
+int64_t fxTypicalSegmentSize(const std::vector<int64_t>& samples,
+                            int64_t firstSample)
+{
+  if (samples.empty()) {
+    return 0;
+  }
+
+  int64_t median = fxMedianSample(samples);
+  if (samples.size() >= 3 && firstSample > 0 && median > 0 &&
+      firstSample * 4 < median) {
+    std::vector<int64_t> filtered;
+    filtered.reserve(samples.size());
+    bool skippedFirst = false;
+    for (auto sample : samples) {
+      if (!skippedFirst && sample == firstSample) {
+        skippedFirst = true;
+        continue;
+      }
+      filtered.push_back(sample);
+    }
+    if (!filtered.empty()) {
+      median = fxMedianSample(filtered);
+    }
+  }
+
+  return median;
+}
+
+void gatherFxMergeStatus(Dict* entryDict, const FxMergeJob& job,
+                         DownloadEngine* e,
+                         const std::vector<std::string>& keys)
+{
+  int64_t totalLength = 0;
+  int64_t completedLength = 0;
+  int64_t downloadSpeed = 0;
+  int64_t finishedBytes = 0;
+  int64_t activeBytes = 0;
+  size_t completed = 0;
+  size_t failed = 0;
+  size_t active = 0;
+  std::vector<int64_t> segmentSizeSamples;
+  int64_t firstSegmentSample = 0;
+
+  for (auto gid : job.childGids) {
+    int64_t childTotalLength = 0;
+    int64_t childCompletedLength = 0;
+    auto group = e->getRequestGroupMan()->findGroup(gid);
+    if (group) {
+      childTotalLength = group->getTotalLength();
+      childCompletedLength = group->getCompletedLength();
+      totalLength += childTotalLength;
+      completedLength += childCompletedLength;
+      downloadSpeed += group->calculateStat().downloadSpeed;
+    }
+    else {
+      auto dr = e->getRequestGroupMan()->findDownloadResult(gid);
+      if (dr) {
+        childTotalLength = dr->totalLength;
+        childCompletedLength = dr->completedLength;
+        totalLength += childTotalLength;
+        completedLength += childCompletedLength;
+      }
+    }
+
+    const auto childPathItr = job.childPath.find(gid);
+    const std::string childPath =
+        childPathItr != job.childPath.end() ? childPathItr->second : std::string();
+    const int64_t observedFileSize = childPath.empty() ? 0 : File(childPath).size();
+    const int64_t observedProgress =
+        std::max<int64_t>(childCompletedLength, observedFileSize);
+
+    auto doneItr = job.childDone.find(gid);
+    if (doneItr != job.childDone.end() && doneItr->second) {
+      auto okItr = job.childOK.find(gid);
+      if (okItr != job.childOK.end() && okItr->second) {
+        ++completed;
+        const int64_t finishedSize = std::max<int64_t>(
+            observedProgress, std::max<int64_t>(childTotalLength, childCompletedLength));
+        if (finishedSize > 0) {
+          finishedBytes += finishedSize;
+          segmentSizeSamples.push_back(finishedSize);
+          if (gid == job.parentGid) {
+            firstSegmentSample = finishedSize;
+          }
+        }
+      }
+      else {
+        ++failed;
+      }
+    }
+    else {
+      ++active;
+      if (observedProgress > 0) {
+        activeBytes += observedProgress;
+      }
+      if (childTotalLength > 0) {
+        segmentSizeSamples.push_back(childTotalLength);
+        if (gid == job.parentGid && firstSegmentSample == 0) {
+          firstSegmentSample = childTotalLength;
+        }
+      }
+    }
+  }
+
+  double downloadProgress = 0.0;
+  if (totalLength > 0) {
+    downloadProgress = static_cast<double>(completedLength) /
+                       static_cast<double>(totalLength);
+  }
+  else if (!job.childGids.empty()) {
+    downloadProgress = static_cast<double>(completed + failed) /
+                       static_cast<double>(job.childGids.size());
+  }
+  if (downloadProgress < 0.0) {
+    downloadProgress = 0.0;
+  }
+  if (downloadProgress > 1.0) {
+    downloadProgress = 1.0;
+  }
+
+  double estimatedDownloadProgress = downloadProgress;
+  const int64_t typicalSegmentSize =
+      fxTypicalSegmentSize(segmentSizeSamples, firstSegmentSample);
+  if (!job.childGids.empty() && typicalSegmentSize > 0) {
+    const int64_t estimatedTotalBytes =
+        finishedBytes + (typicalSegmentSize * static_cast<int64_t>(active + job.childGids.size() - completed - failed - active));
+    const int64_t estimatedCompletedBytes = finishedBytes + activeBytes;
+    if (estimatedTotalBytes > 0) {
+      estimatedDownloadProgress = static_cast<double>(estimatedCompletedBytes) /
+                                  static_cast<double>(estimatedTotalBytes);
+    }
+  }
+  else if (!job.childGids.empty()) {
+    estimatedDownloadProgress =
+        (static_cast<double>(completed) + (0.5 * static_cast<double>(active))) /
+        static_cast<double>(job.childGids.size());
+  }
+  if (estimatedDownloadProgress < 0.0) {
+    estimatedDownloadProgress = 0.0;
+  }
+  if (estimatedDownloadProgress > 1.0) {
+    estimatedDownloadProgress = 1.0;
+  }
+
+  double overallProgress = estimatedDownloadProgress;
+  if (job.state == FX_MERGE_MERGING) {
+    overallProgress = 0.95 + (0.05 * job.mergeProgress);
+  }
+  else if (job.state == FX_MERGE_MERGED) {
+    overallProgress = 1.0;
+  }
+  if (overallProgress < 0.0) {
+    overallProgress = 0.0;
+  }
+  if (overallProgress > 1.0) {
+    overallProgress = 1.0;
+  }
+
+  const bool retryable =
+      job.state == FX_MERGE_FAILED && fxAllChildrenDone(job) &&
+      !fxAnyChildFailed(job) && job.errorCode != FX_MERGE_ERR_CANCELED;
+
+  const char* outcome = "running";
+  if (job.state == FX_MERGE_MERGED) {
+    outcome = "succeeded";
+  }
+  else if (job.state == FX_MERGE_FAILED) {
+    outcome = retryable ? "retryable-failure" : "failed";
+  }
+
+  if (requested_key(keys, KEY_GID)) {
+    entryDict->put(KEY_GID, GroupId::toHex(job.parentGid));
+  }
+  if (requested_key(keys, KEY_TOTAL_LENGTH)) {
+    entryDict->put(KEY_TOTAL_LENGTH, util::itos(totalLength));
+  }
+  if (requested_key(keys, KEY_COMPLETED_LENGTH)) {
+    entryDict->put(KEY_COMPLETED_LENGTH, util::itos(completedLength));
+  }
+  if (requested_key(keys, KEY_DOWNLOAD_SPEED)) {
+    entryDict->put(KEY_DOWNLOAD_SPEED, util::itos(downloadSpeed));
+  }
+  if (requested_key(keys, KEY_STATUS)) {
+    if (job.state == FX_MERGE_MERGED) {
+      entryDict->put(KEY_STATUS, VLB_COMPLETE);
+    }
+    else if (job.state == FX_MERGE_FAILED) {
+      entryDict->put(KEY_STATUS, VLB_ERROR);
+    }
+    else {
+      entryDict->put(KEY_STATUS, VLB_ACTIVE);
+    }
+  }
+  if (requested_key(keys, KEY_ERROR_CODE)) {
+    entryDict->put(KEY_ERROR_CODE, util::itos(job.errorCode));
+  }
+  if (requested_key(keys, KEY_ERROR_MESSAGE) && !job.errorMessage.empty()) {
+    entryDict->put(KEY_ERROR_MESSAGE, job.errorMessage);
+  }
+  if (requested_key(keys, KEY_FOLLOWED_BY)) {
+    auto list = List::g();
+    for (auto gid : job.childGids) {
+      if (gid != job.parentGid) {
+        list->append(GroupId::toHex(gid));
+      }
+    }
+    entryDict->put(KEY_FOLLOWED_BY, std::move(list));
+  }
+
+  if (requested_key(keys, KEY_MERGE)) {
+    auto merge = Dict::g();
+    merge->put("state", fxMergeStateName(job.state));
+    merge->put("stage", fxMergeStateName(job.state));
+    merge->put("total", util::uitos(job.childGids.size()));
+    merge->put("completed", util::uitos(completed));
+    merge->put("failed", util::uitos(failed));
+    merge->put("output", job.outputPath);
+    merge->put("mode", job.mode);
+    merge->put("mergeProgress", fmt("%.3f", job.mergeProgress));
+    merge->put("downloadProgress", fmt("%.3f", downloadProgress));
+    merge->put("estimatedDownloadProgress", fmt("%.3f", estimatedDownloadProgress));
+    merge->put("overallProgress", fmt("%.3f", overallProgress));
+    merge->put("cancelRequested", job.cancelRequested ? VLB_TRUE : VLB_FALSE);
+    merge->put("terminal", fxIsTerminalState(job.state) ? VLB_TRUE : VLB_FALSE);
+    merge->put("retryable", retryable ? VLB_TRUE : VLB_FALSE);
+    merge->put("outcome", outcome);
+    entryDict->put(KEY_MERGE, std::move(merge));
+  }
+}
+} // namespace
+
 std::unique_ptr<ValueBase> TellStatusRpcMethod::process(const RpcRequest& req,
                                                         DownloadEngine* e)
 {
+  fxPruneExpiredMergeJobs();
+
   const String* gidParam = checkRequiredParam<String>(req, 0);
   const List* keysParam = checkParam<List>(req, 1);
 
-  a2_gid_t gid = str2Gid(gidParam);
+  a2_gid_t gid;
+  const bool exactGid =
+      GroupId::toNumericId(gid, gidParam->s().c_str()) == 0;
   std::vector<std::string> keys;
   toStringList(std::back_inserter(keys), keysParam);
+
+  auto mergeItr = exactGid ? fxMergeJobs.find(gid) : fxMergeJobs.end();
+  if (mergeItr != fxMergeJobs.end()) {
+    auto entryDict = Dict::g();
+    gatherFxMergeStatus(entryDict.get(), mergeItr->second, e, keys);
+    return std::move(entryDict);
+  }
+
+  gid = str2Gid(gidParam);
 
   auto group = e->getRequestGroupMan()->findGroup(gid);
   auto entryDict = Dict::g();
