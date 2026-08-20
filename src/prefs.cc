@@ -217,6 +217,9 @@ PrefPtr PREF_INPUT_FILE = makePref("input-file");
 PrefPtr PREF_DEFERRED_INPUT = makePref("deferred-input");
 // value: 1*digit
 PrefPtr PREF_MAX_CONCURRENT_DOWNLOADS = makePref("max-concurrent-downloads");
+// value: 1*digit (0 = unlimited)
+PrefPtr PREF_MAX_CONCURRENT_DOWNLOADS_PER_DOMAIN =
+    makePref("max-concurrent-downloads-per-domain");
 // value: true | false | A:B
 PrefPtr PREF_OPTIMIZE_CONCURRENT_DOWNLOADS =
     makePref("optimize-concurrent-downloads");

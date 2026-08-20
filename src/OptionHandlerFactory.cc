@@ -438,6 +438,14 @@ std::vector<OptionHandler*> OptionHandlerFactory::createOptionHandlers()
     handlers.push_back(op);
   }
   {
+    OptionHandler* op(new NumberOptionHandler(
+        PREF_MAX_CONCURRENT_DOWNLOADS_PER_DOMAIN,
+        TEXT_MAX_CONCURRENT_DOWNLOADS_PER_DOMAIN, "0", 0, -1));
+    op->addTag(TAG_BASIC);
+    op->setChangeGlobalOption(true);
+    handlers.push_back(op);
+  }
+  {
     OptionHandler* op(new NumberOptionHandler(PREF_MAX_CONNECTION_PER_SERVER,
                                               TEXT_MAX_CONNECTION_PER_SERVER,
                                               "1", 1, 16, 'x'));

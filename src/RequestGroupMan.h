@@ -41,6 +41,7 @@
 #include <deque>
 #include <vector>
 #include <map>
+#include <set>
 #include <memory>
 
 #include "DownloadResult.h"
@@ -77,6 +78,25 @@ private:
   std::vector<std::shared_ptr<DownloadResult>> unfinishedDownloadResults_;
 
   int maxConcurrentDownloads_;
+
+  // Maximum number of concurrent HTTP connections aria2 will hold open to
+  // any single domain, summed across all active downloads whose first URI
+  // shares that domain (not just a count of downloads: a single download
+  // can itself use several connections via split/max-connection-per-server,
+  // and that gets counted too -- see getRequestGroupConnectionWeight).
+  // 0 means no per-domain limit.
+  int maxConcurrentDownloadsPerDomain_;
+
+  // Sum of connection weights (see getRequestGroupConnectionWeight) of
+  // currently active downloads, keyed by the domain of each RequestGroup's
+  // first URI. Only domains with at least one active download are present.
+  std::map<std::string, int> activeConnectionsByDomain_;
+
+  // Domains for which we have already logged a per-domain throttle
+  // notice since they last dropped below the limit. Used to emit at
+  // most one log line per throttle episode instead of one per
+  // deferred activation attempt.
+  std::set<std::string> loggedThrottledDomains_;
 
   bool optimizeConcurrentDownloads_;
   double optimizeConcurrentDownloadsCoeffA_;
@@ -148,6 +168,19 @@ private:
   int optimizeConcurrentDownloads();
 
 public:
+  // Returns the lower-cased host of group's first URI (spent or
+  // remaining), or an empty string if group has no URI at all.
+  static std::string getRequestGroupDomain(const RequestGroup* group);
+
+  // Returns how many concurrent HTTP connections group is configured to
+  // use against a single server: min(split, max-connection-per-server),
+  // clamped to at least 1. This reflects whatever is currently set on
+  // group's own Option -- fillRequestGroupFromReserver may lower these
+  // values at admission time to fit the domain's remaining connection
+  // budget, in which case a later call here (e.g. on completion, to know
+  // how much to give back) returns that same clamped figure.
+  static int getRequestGroupConnectionWeight(const RequestGroup* group);
+
   RequestGroupMan(std::vector<std::shared_ptr<RequestGroup>> requestGroups,
                   int maxConcurrentDownloads, const Option* option);
 
@@ -318,6 +351,16 @@ public:
 
   void setMaxConcurrentDownloads(int max) { maxConcurrentDownloads_ = max; }
 
+  void setMaxConcurrentDownloadsPerDomain(int max)
+  {
+    maxConcurrentDownloadsPerDomain_ = max;
+  }
+
+  int getMaxConcurrentDownloadsPerDomain() const
+  {
+    return maxConcurrentDownloadsPerDomain_;
+  }
+
   // Call this function if requestGroups_ queue should be maintained.
   // This function is added to reduce the call of maintenance, but at
   // the same time, it provides fast maintenance reaction.
@@ -365,7 +408,13 @@ public:
     return openedFileCounter_;
   }
 
-  void decreaseNumActive();
+  // If domain is non-empty, also subtracts connectionWeight from
+  // activeConnectionsByDomain_[domain] (erasing the entry once it reaches
+  // 0). Callers should pass getRequestGroupConnectionWeight(group) for the
+  // group that just stopped, so the exact amount reserved at admission
+  // time is given back.
+  void decreaseNumActive(const std::string& domain = std::string(),
+                         int connectionWeight = 1);
 };
 
 } // namespace aria2

@@ -106,6 +106,8 @@ RequestGroupMan::RequestGroupMan(
     std::vector<std::shared_ptr<RequestGroup>> requestGroups,
     int maxConcurrentDownloads, const Option* option)
     : maxConcurrentDownloads_(maxConcurrentDownloads),
+      maxConcurrentDownloadsPerDomain_(
+          option->getAsInt(PREF_MAX_CONCURRENT_DOWNLOADS_PER_DOMAIN)),
       optimizeConcurrentDownloads_(false),
       optimizeConcurrentDownloadsCoeffA_(5.),
       optimizeConcurrentDownloadsCoeffB_(25.),
@@ -355,7 +357,9 @@ public:
           group->getDownloadContext();
 
       if (!group->isSeedOnlyEnabled()) {
-        e_->getRequestGroupMan()->decreaseNumActive();
+        e_->getRequestGroupMan()->decreaseNumActive(
+            RequestGroupMan::getRequestGroupDomain(group.get()),
+            RequestGroupMan::getRequestGroupConnectionWeight(group.get()));
       }
 
       // DownloadContext::resetDownloadStopTime() is only called when
@@ -551,6 +555,54 @@ void RequestGroupMan::fillRequestGroupFromReserver(DownloadEngine* e)
       pending.push_back(groupToAdd);
       continue;
     }
+    std::string domain;
+    int connectionWeight = 1;
+    if (maxConcurrentDownloadsPerDomain_ > 0) {
+      domain = getRequestGroupDomain(groupToAdd.get());
+      if (!domain.empty()) {
+        auto dit = activeConnectionsByDomain_.find(domain);
+        int used = dit == activeConnectionsByDomain_.end() ? 0 : dit->second;
+        if (used >= maxConcurrentDownloadsPerDomain_) {
+          if (loggedThrottledDomains_.insert(domain).second) {
+            A2_LOG_WARN(fmt("Throttling started for domain=%s: "
+                            "%d connections active >= max-concurrent-downloads-per-domain=%d",
+                            domain.c_str(), used,
+                            maxConcurrentDownloadsPerDomain_));
+          }
+          pending.push_back(groupToAdd);
+          continue;
+        }
+        // Admit, but clamp this download's own connection fan-out so it
+        // (plus whatever else is already active for this domain) doesn't
+        // exceed the configured budget. A single fast/small download isn't
+        // worth reserving its full split/max-connection-per-server for --
+        // clamp down to whatever headroom is left, with a floor of 1 so a
+        // download is never starved outright.
+        int desired = getRequestGroupConnectionWeight(groupToAdd.get());
+        int allowed = std::max(1, maxConcurrentDownloadsPerDomain_ - used);
+        connectionWeight = std::min(desired, allowed);
+        if (connectionWeight < desired) {
+          // numConcurrentCommand_ is what createInitialCommand() actually
+          // reads to decide how many connections to open -- it was cached
+          // from PREF_SPLIT in the RequestGroup constructor, so merely
+          // rewriting the Option here (kept below for consistency/anything
+          // else that reads it back, e.g. getRequestGroupConnectionWeight
+          // on completion) would silently have no effect on the real
+          // connection count without also updating this directly.
+          groupToAdd->setNumConcurrentCommand(connectionWeight);
+          const auto& groupOption = groupToAdd->getOption();
+          groupOption->put(PREF_SPLIT, util::itos(connectionWeight));
+          groupOption->put(PREF_MAX_CONNECTION_PER_SERVER,
+                           util::itos(connectionWeight));
+          A2_LOG_WARN(fmt("Capping connections for domain=%s gid=%s: "
+                          "wanted %d, granted %d (domain budget=%d, %d already in use)",
+                          domain.c_str(),
+                          GroupId::toHex(groupToAdd->getGID()).c_str(), desired,
+                          connectionWeight, maxConcurrentDownloadsPerDomain_,
+                          used));
+        }
+      }
+    }
     // Drop pieceStorage here because paused download holds its
     // reference.
     groupToAdd->dropPieceStorage();
@@ -558,6 +610,9 @@ void RequestGroupMan::fillRequestGroupFromReserver(DownloadEngine* e)
     groupToAdd->setRequestGroupMan(this);
     groupToAdd->setState(RequestGroup::STATE_ACTIVE);
     ++numActive_;
+    if (!domain.empty()) {
+      activeConnectionsByDomain_[domain] += connectionWeight;
+    }
     requestGroups_.push_back(groupToAdd->getGID(), groupToAdd);
     try {
       auto res = createInitialCommand(groupToAdd, e);
@@ -1055,10 +1110,64 @@ void RequestGroupMan::initWrDiskCache()
   }
 }
 
-void RequestGroupMan::decreaseNumActive()
+std::string RequestGroupMan::getRequestGroupDomain(const RequestGroup* group)
+{
+  const auto& dctx = group->getDownloadContext();
+  if (!dctx) {
+    return std::string();
+  }
+  const auto& fileEntry = dctx->getFirstFileEntry();
+  if (!fileEntry) {
+    return std::string();
+  }
+  std::vector<std::string> uris = fileEntry->getUris();
+  if (uris.empty()) {
+    return std::string();
+  }
+  const std::string& uri = uris.front();
+  uri_split_result us;
+  if (uri_split(&us, uri.c_str()) != 0) {
+    return std::string();
+  }
+  return util::toLower(uri::getFieldString(us, USR_HOST, uri.c_str()));
+}
+
+int RequestGroupMan::getRequestGroupConnectionWeight(const RequestGroup* group)
+{
+  const auto& option = group->getOption();
+  if (!option) {
+    return 1;
+  }
+  int split = option->getAsInt(PREF_SPLIT);
+  int maxConnPerServer = option->getAsInt(PREF_MAX_CONNECTION_PER_SERVER);
+  int weight = std::min(split, maxConnPerServer);
+  return std::max(1, weight);
+}
+
+void RequestGroupMan::decreaseNumActive(const std::string& domain,
+                                        int connectionWeight)
 {
   assert(numActive_ > 0);
   --numActive_;
+  if (!domain.empty()) {
+    auto it = activeConnectionsByDomain_.find(domain);
+    if (it != activeConnectionsByDomain_.end()) {
+      int remaining = (it->second -= std::max(1, connectionWeight));
+      if (remaining <= 0) {
+        activeConnectionsByDomain_.erase(it);
+        // Only log "end" (and re-arm the "start" log for a future episode) once this domain
+        // has nothing active left at all -- not merely dipped under the cap. A bulk multi-
+        // segment download (hundreds of small HLS segments) hovers AT the cap for its whole
+        // run: each segment finishing frees one slot that the next queued segment fills right
+        // back up, so clearing on every such dip logged a fresh "start" per segment (hundreds
+        // of near-identical lines for one continuous throttle episode). Idle is the one signal
+        // that's actually "nothing left waiting on this domain."
+        if (loggedThrottledDomains_.erase(domain) > 0) {
+          A2_LOG_WARN(fmt("Throttling ended for domain=%s", domain.c_str()));
+        }
+      }
+    }
+  }
 }
 
 int RequestGroupMan::optimizeConcurrentDownloads()

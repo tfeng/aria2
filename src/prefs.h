@@ -173,6 +173,8 @@ extern PrefPtr PREF_INPUT_FILE;
 extern PrefPtr PREF_DEFERRED_INPUT;
 // value: 1*digit
 extern PrefPtr PREF_MAX_CONCURRENT_DOWNLOADS;
+// value: 1*digit (0 = unlimited)
+extern PrefPtr PREF_MAX_CONCURRENT_DOWNLOADS_PER_DOMAIN;
 // value: true | false
 extern PrefPtr PREF_OPTIMIZE_CONCURRENT_DOWNLOADS;
 // value: 1*digit ['.' [ 1*digit ] ]

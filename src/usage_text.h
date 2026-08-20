@@ -245,6 +245,12 @@
   _(" -j, --max-concurrent-downloads=N Set maximum number of parallel downloads for\n" \
     "                              every static (HTTP/FTP) URL, torrent and metalink.\n" \
     "                              See also --split and --optimize-concurrent-downloads options.")
+#define TEXT_MAX_CONCURRENT_DOWNLOADS_PER_DOMAIN                        \
+  _(" --max-concurrent-downloads-per-domain=N Set maximum number of parallel\n" \
+    "                              downloads whose first URI shares the same domain.\n" \
+    "                              This is independent of --max-concurrent-downloads,\n" \
+    "                              which limits the total number of parallel downloads.\n" \
+    "                              0 means no per-domain limit. Default: 0")
 #define TEXT_OPTIMIZE_CONCURRENT_DOWNLOADS\
   _(" --optimize-concurrent-downloads[=true|false|A:B] Optimizes the number of\n" \
     "                              concurrent downloads according to the bandwidth\n" \

@@ -402,10 +402,12 @@ bool fxAnyChildFailed(const FxMergeJob& job)
 
 bool fxCollectPendingAria2Sidecars(const std::string& dir,
                                    std::vector<std::string>& pending,
-                                   std::string& err)
+                                   std::string& err, bool& dirMissing)
 {
+  dirMissing = false;
   DIR* d = opendir(dir.c_str());
   if (!d) {
+    dirMissing = (errno == ENOENT);
     err = fmt("could not open segments directory: %s errno=%d", dir.c_str(),
               errno);
     return false;
@@ -428,10 +430,46 @@ bool fxCollectPendingAria2Sidecars(const std::string& dir,
   return true;
 }
 
+// Sanity check used when the segments directory itself is unreadable (see
+// fxSegmentsReadyForFinalize below): verifies every expected segment file is
+// actually present and non-empty on disk, independent of the directory
+// listing that just failed.
+bool fxAllSegmentFilesPresent(const FxMergeJob& job, std::string& err)
+{
+  for (const auto& path : job.segmentPaths) {
+    File f(path);
+    if (!f.isFile() || f.size() <= 0) {
+      err = fmt("expected segment file missing or empty: %s", path.c_str());
+      return false;
+    }
+  }
+  return true;
+}
+
 bool fxSegmentsReadyForFinalize(FxMergeJob& job, std::string& err)
 {
   std::vector<std::string> pendingSidecars;
-  if (!fxCollectPendingAria2Sidecars(job.tmpDir, pendingSidecars, err)) {
+  bool dirMissing = false;
+  if (!fxCollectPendingAria2Sidecars(job.tmpDir, pendingSidecars, err,
+                                     dirMissing)) {
+    // Observed intermittently (3 times in production so far, always on a
+    // small/fast single-segment job racing alongside other concurrent
+    // downloads): opendir() on tmpDir fails with ENOENT even though the
+    // child download already completed successfully and its file is on
+    // disk. Root cause not confirmed, but since the actual segment file's
+    // presence is the thing that matters (not the directory listing used
+    // to check for leftover .aria2 sidecars), fall back to verifying the
+    // file directly rather than failing a completed download.
+    if (dirMissing) {
+      std::string filesErr;
+      if (fxAllSegmentFilesPresent(job, filesErr)) {
+        A2_LOG_WARN(fmt("[fxmerge] parent=%s segments directory listing failed (%s) "
+                        "but all %lu segment file(s) verified present on disk; proceeding",
+                        GroupId::toHex(job.parentGid).c_str(), err.c_str(),
+                        static_cast<unsigned long>(job.segmentPaths.size())));
+        return true;
+      }
+    }
     return false;
   }
   if (!pendingSidecars.empty()) {
@@ -3248,6 +3286,11 @@ void changeGlobalOption(const Option& option, DownloadEngine* e)
   if (option.defined(PREF_MAX_CONCURRENT_DOWNLOADS)) {
     e->getRequestGroupMan()->setMaxConcurrentDownloads(
         option.getAsInt(PREF_MAX_CONCURRENT_DOWNLOADS));
+    e->getRequestGroupMan()->requestQueueCheck();
+  }
+  if (option.defined(PREF_MAX_CONCURRENT_DOWNLOADS_PER_DOMAIN)) {
+    e->getRequestGroupMan()->setMaxConcurrentDownloadsPerDomain(
+        option.getAsInt(PREF_MAX_CONCURRENT_DOWNLOADS_PER_DOMAIN));
     e->getRequestGroupMan()->requestQueueCheck();
   }
   if (option.defined(PREF_OPTIMIZE_CONCURRENT_DOWNLOADS)) {
