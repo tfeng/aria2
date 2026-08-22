@@ -202,6 +202,7 @@ const int FX_MERGE_ERR_REMUX = 2002;
 const int FX_MERGE_ERR_RENAME = 2003;
 const int FX_MERGE_ERR_PATH = 2004;
 const int FX_MERGE_ERR_INIT = 2005;
+const int FX_MERGE_ERR_SUPERSEDED = 2006;
 const int FX_MERGE_ERR_CANCELED = 2007;
 
 const std::time_t FX_MERGE_JOB_TTL_SECONDS = 30 * 60;
@@ -1202,6 +1203,75 @@ std::unique_ptr<ValueBase> AddUriRpcMethod::process(const RpcRequest& req,
   }
 }
 
+// Reclaim `outputPath`'s ownership for a fresh `addMerge` (the FXPlayer "retry failed download"
+// button, and generally: overwrite=true means "start this exact output over, whatever else is
+// there"). Two cases, depending on the existing owner's state:
+//   TERMINAL (failed/merged): clean up its artifacts and erase it now, synchronously — no lingering
+//   state, so the new job can reuse the default `outputPath + ".segments"` tmpDir safely.
+//   NON-TERMINAL (still queued/downloading/merging): its children can't be torn down synchronously
+//   within this single RPC call (aria2's engine only actually stops them on a later tick), so
+//   erasing it now would leave them writing into the SAME tmpDir the new job is about to use —
+//   racing to corrupt each other's segments. Instead: force-halt its children (mirrors
+//   `aria2.forceRemove`), mark the OLD job failed/cleanup-pending so the EXISTING
+//   `fxMergeOnGroupStopped` machinery cleans it up asynchronously once its children actually stop
+//   (the normal path for any canceled job), and hand the NEW job a time-suffixed tmpDir so the two
+//   can never collide. Only the output-path OWNERSHIP is reassigned here; the old job keeps existing
+//   under its own GID until it naturally goes terminal.
+// Returns the tmpDir the new job should use ("" = caller keeps its own default).
+std::string fxSupersedeOwnerForOverwrite(const std::string& outputPath, DownloadEngine* e)
+{
+  auto ownerItr = fxMergeOutputOwner.find(outputPath);
+  if (ownerItr == fxMergeOutputOwner.end()) {
+    return "";
+  }
+  const auto oldGid = ownerItr->second;
+  auto existing = fxMergeJobs.find(oldGid);
+  if (existing == fxMergeJobs.end()) {
+    // Stale owner entry (job already evicted) — just drop it.
+    fxMergeOutputOwner.erase(ownerItr);
+    return "";
+  }
+  auto& job = existing->second;
+  if (fxIsTerminalState(job.state)) {
+    A2_LOG_WARN(fmt("[fxmerge] overwrite: reclaiming output=%s from terminal parent=%s state=%s",
+                    outputPath.c_str(), GroupId::toHex(oldGid).c_str(),
+                    fxMergeStateName(job.state)));
+    if (job.state == FX_MERGE_FAILED) {
+      fxCleanupFailureArtifacts(job);
+    }
+    File(fxMergePartPath(job)).remove();
+    File(job.outputPath + ".part").remove();
+    File(job.outputPath).remove();
+    fxEraseMergeJob(oldGid);
+    e->getRequestGroupMan()->removeDownloadResult(oldGid);
+    return "";
+  }
+
+  A2_LOG_WARN(fmt("[fxmerge] overwrite: superseding LIVE parent=%s state=%s output=%s "
+                  "(halting %lu child(ren) asynchronously)",
+                  GroupId::toHex(oldGid).c_str(), fxMergeStateName(job.state),
+                  outputPath.c_str(),
+                  static_cast<unsigned long>(job.childGids.size())));
+  for (auto childGid : job.childGids) {
+    auto child = e->getRequestGroupMan()->findGroup(childGid);
+    if (!child) {
+      continue;
+    }
+    if (child->getState() == RequestGroup::STATE_ACTIVE) {
+      child->setForceHaltRequested(true, RequestGroup::USER_REQUEST);
+    }
+    else if (child->isDependencyResolved()) {
+      e->getRequestGroupMan()->removeReservedGroup(childGid);
+    }
+  }
+  e->setRefreshInterval(std::chrono::milliseconds(0));
+  fxMarkFailed(job, FX_MERGE_ERR_SUPERSEDED, "superseded by a new retry (overwrite=true)", true);
+  fxMergeOutputOwner.erase(ownerItr);   // new job claims the path; old GID lives on until its
+                                        // children report done, then self-cleans as usual.
+  return outputPath + ".segments." + std::to_string(std::time(nullptr)) + "." +
+         GroupId::toHex(oldGid);
+}
+
 std::unique_ptr<ValueBase> FxplayerAddMergeRpcMethod::process(
     const RpcRequest& req, DownloadEngine* e)
 {
@@ -1226,25 +1296,37 @@ std::unique_ptr<ValueBase> FxplayerAddMergeRpcMethod::process(
   std::string outputPath = outputParam->s();
   outputPathForLog = outputPath;
 
-  auto ownerItr = fxMergeOutputOwner.find(outputPath);
-  if (ownerItr != fxMergeOutputOwner.end()) {
-    auto existing = fxMergeJobs.find(ownerItr->second);
-    if (existing != fxMergeJobs.end()) {
-      if (existing->second.state != FX_MERGE_FAILED) {
-        A2_LOG_WARN(fmt("[fxmerge] add idempotent reuse output=%s existingParent=%s state=%s",
-                        outputPath.c_str(),
-                        GroupId::toHex(ownerItr->second).c_str(),
-                        fxMergeStateName(existing->second.state)));
-        return createGIDResponse(ownerItr->second);
+  // overwrite=true (the FXPlayer "retry failed download" button): unconditionally reclaim
+  // `outputPath`, whatever state its previous owner is in, instead of the normal idempotent-reuse-
+  // or-collision-error behavior below. See fxSupersedeOwnerForOverwrite's doc comment.
+  const bool overwrite = getBoolField(mergeOptsParam, "overwrite", false);
+  std::string tmpDir;
+  if (overwrite) {
+    tmpDir = fxSupersedeOwnerForOverwrite(outputPath, e);
+  }
+  else {
+    auto ownerItr = fxMergeOutputOwner.find(outputPath);
+    if (ownerItr != fxMergeOutputOwner.end()) {
+      auto existing = fxMergeJobs.find(ownerItr->second);
+      if (existing != fxMergeJobs.end()) {
+        if (existing->second.state != FX_MERGE_FAILED) {
+          A2_LOG_WARN(fmt("[fxmerge] add idempotent reuse output=%s existingParent=%s state=%s",
+                          outputPath.c_str(),
+                          GroupId::toHex(ownerItr->second).c_str(),
+                          fxMergeStateName(existing->second.state)));
+          return createGIDResponse(ownerItr->second);
+        }
+        throw DL_ABORT_EX(fmt("merge output collision: output already claimed by GID#%s state=%s",
+                              GroupId::toHex(ownerItr->second).c_str(),
+                              fxMergeStateName(existing->second.state)));
       }
-      throw DL_ABORT_EX(fmt("merge output collision: output already claimed by GID#%s state=%s",
-                            GroupId::toHex(ownerItr->second).c_str(),
-                            fxMergeStateName(existing->second.state)));
+      fxMergeOutputOwner.erase(ownerItr);
     }
-    fxMergeOutputOwner.erase(ownerItr);
   }
 
-  std::string tmpDir = outputPath + ".segments";
+  if (tmpDir.empty()) {
+    tmpDir = outputPath + ".segments";
+  }
   if (const auto* tmpParam = getStringField(mergeOptsParam, "tmpDir")) {
     if (!tmpParam->s().empty()) {
       tmpDir = tmpParam->s();
@@ -1354,11 +1436,11 @@ std::unique_ptr<ValueBase> FxplayerAddMergeRpcMethod::process(
 
   e->getRequestGroupMan()->addReservedGroup(groups);
 
-  A2_LOG_WARN(fmt("[fxmerge] add parent=%s segments=%lu mode=%s remux=%s tmpDir=%s output=%s",
+  A2_LOG_WARN(fmt("[fxmerge] add parent=%s segments=%lu mode=%s remux=%s tmpDir=%s output=%s overwrite=%s",
                   GroupId::toHex(parentGid).c_str(),
                   static_cast<unsigned long>(groups.size()), mode.c_str(),
                   remux ? "true" : "false", tmpDir.c_str(),
-                  outputPath.c_str()));
+                  outputPath.c_str(), overwrite ? "true" : "false"));
 
   return createGIDResponse(parentGid);
   }
