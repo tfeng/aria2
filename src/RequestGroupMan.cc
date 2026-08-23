@@ -35,6 +35,7 @@
 #include "RequestGroupMan.h"
 
 #include <unistd.h>
+#include <fcntl.h>
 #include <cstring>
 #include <iomanip>
 #include <sstream>
@@ -61,6 +62,9 @@
 #include "Option.h"
 #include "prefs.h"
 #include "File.h"
+#include "SimpleRandomizer.h"
+#include <fstream>
+#include <sstream>
 #include "util.h"
 #include "Command.h"
 #include "FileEntry.h"
@@ -90,6 +94,19 @@
 #endif // ENABLE_BITTORRENT
 
 namespace aria2 {
+
+namespace {
+// Lower-case and strip trailing dots so "HLS.Example.com." and "hls.example.com" share one key --
+// otherwise a fully-qualified host silently misses a per-domain cap/pacing override.
+std::string normalizeDomainKey(std::string host)
+{
+  host = util::toLower(host);
+  while (!host.empty() && host.back() == '.') {
+    host.pop_back();
+  }
+  return host;
+}
+} // namespace
 
 namespace {
 template <typename InputIterator>
@@ -357,9 +374,8 @@ public:
           group->getDownloadContext();
 
       if (!group->isSeedOnlyEnabled()) {
-        e_->getRequestGroupMan()->decreaseNumActive(
-            RequestGroupMan::getRequestGroupDomain(group.get()),
-            RequestGroupMan::getRequestGroupConnectionWeight(group.get()));
+        auto budget = group->takeAdmittedConnectionBudget();
+        e_->getRequestGroupMan()->decreaseNumActive(budget.first, budget.second);
       }
 
       // DownloadContext::resetDownloadStopTime() is only called when
@@ -517,6 +533,18 @@ createInitialCommand(const std::shared_ptr<RequestGroup>& requestGroup,
 }
 } // namespace
 
+namespace {
+// Log level for the "Throttling started/ended" pair. A cap-1 domain (XNXX/XVideos CDNs, forced
+// sequential) is AT its cap for every segment by design and goes idle between paced segments, so
+// it logged one start/end pair PER SEGMENT (~2.3k pairs/day) -- normal operation, not an event.
+// Those go to INFO; a real fan-out cap (> 1) being hit stays at WARN. Logging only: the
+// loggedThrottledDomains_ episode bookkeeping is unchanged.
+Logger::LEVEL throttleLogLevel(int effectiveCap)
+{
+  return effectiveCap == 1 ? Logger::A2_INFO : Logger::A2_WARN;
+}
+} // namespace
+
 void RequestGroupMan::fillRequestGroupFromReserver(DownloadEngine* e)
 {
   removeStoppedGroup(e);
@@ -531,6 +559,19 @@ void RequestGroupMan::fillRequestGroupFromReserver(DownloadEngine* e)
   int count = 0;
   int num = maxConcurrentDownloads - numActive_;
   std::vector<std::shared_ptr<RequestGroup>> pending;
+  // FXPlayer (2026-11-14): per-pass memo of domains already deferred, so the rest of a held domain's queue goes
+  // straight to `pending` instead of re-running every check (this pass runs every 250 ms over the whole reserved
+  // queue while segments are held). Sound because within one pass a domain's pacing clock, video-gap state,
+  // volume-budget log and active connections only change when one of its groups is admitted -- which can only make
+  // a deferral stricter, and which clears that domain's memo below anyway. Each memo sits exactly where its check
+  // runs, so the checks before it (and their side effects) still run in the original order:
+  //   paceDeferred: the pacing check -- the same answer for every group of the domain;
+  //   gapDeferred:  the video-gap check -- per (domain, video identity), since it depends on the group's video;
+  //   laterDeferred: the volume budget and connection cap -- the same for every group that got past the gap.
+  // fxMergeAdmissionCheck (drops, link expiry) still runs for every group, before any of them.
+  std::set<std::string> paceDeferred;
+  std::map<std::string, std::set<a2_gid_t>> gapDeferred;
+  std::set<std::string> laterDeferred;
 
   while (count < num && (uriListParser_ || !reservedGroups_.empty())) {
     if (uriListParser_ && reservedGroups_.empty()) {
@@ -555,53 +596,187 @@ void RequestGroupMan::fillRequestGroupFromReserver(DownloadEngine* e)
       pending.push_back(groupToAdd);
       continue;
     }
+    // FXPlayer (2026-11-08): a merge segment reused from disk, one whose signed link already expired, or one
+    // left over from a job that already failed is dropped here -- before pacing or the volume budget count it.
+    if (rpc::fxMergeAdmissionCheck(groupToAdd, e)) {
+      rpc::fxForgetMergeChild(groupToAdd->getGID()); // dropped: never runs, never has a result to serialize
+      continue;
+    }
     std::string domain;
     int connectionWeight = 1;
-    if (maxConcurrentDownloadsPerDomain_ > 0) {
-      domain = getRequestGroupDomain(groupToAdd.get());
-      if (!domain.empty()) {
-        auto dit = activeConnectionsByDomain_.find(domain);
-        int used = dit == activeConnectionsByDomain_.end() ? 0 : dit->second;
-        if (used >= maxConcurrentDownloadsPerDomain_) {
-          if (loggedThrottledDomains_.insert(domain).second) {
-            A2_LOG_WARN(fmt("Throttling started for domain=%s: "
-                            "%d connections active >= max-concurrent-downloads-per-domain=%d",
-                            domain.c_str(), used,
-                            maxConcurrentDownloadsPerDomain_));
-          }
+    // FXPlayer extension: compute the domain unconditionally (cheap -- just reads the group's
+    // first URI) so a per-domain override (domainConnectionCapOverrides_, e.g. XNXX's CDN
+    // clamped to 1) still applies even when maxConcurrentDownloadsPerDomain_ itself is 0
+    // (unlimited) -- an override should never depend on the global default being enabled.
+    domain = cachedRequestGroupDomainKey(groupToAdd.get());
+    // FXPlayer extension: captured before the `else { domain.clear(); }` branch below can clear
+    // `domain` (when there's no active connection-cap override) -- pacing must still be checked
+    // and recorded for a domain that's paced but not connection-capped, since the two overrides
+    // are independent (see domainMinAdmissionIntervalOverrides_'s own doc comment).
+    const std::string pacingDomain = domain;
+    if (!pacingDomain.empty()) {
+      if (paceDeferred.count(pacingDomain) > 0) {
+        pending.push_back(groupToAdd);
+        continue;
+      }
+      auto minInterval = effectiveDomainMinAdmissionInterval(pacingDomain);
+      if (minInterval.count() > 0) {
+        auto lastIt = domainLastAdmissionAt_.find(pacingDomain);
+        // A fresh Timer (not global::wallclock()): the cached wallclock is only refreshed once per
+        // event-loop iteration, and an iteration can be held up for seconds by a blocking disk write
+        // (e.g. while a finished merge is being fsync'd on the same disk). A stale reading here
+        // recorded admissions too early and let the next one through up to ~1.4s ahead of schedule.
+        if (lastIt != domainLastAdmissionAt_.end() &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                lastIt->second.difference(Timer())) < minInterval) {
+          paceDeferred.insert(pacingDomain);
           pending.push_back(groupToAdd);
           continue;
         }
-        // Admit, but clamp this download's own connection fan-out so it
-        // (plus whatever else is already active for this domain) doesn't
-        // exceed the configured budget. A single fast/small download isn't
-        // worth reserving its full split/max-connection-per-server for --
-        // clamp down to whatever headroom is left, with a floor of 1 so a
-        // download is never starved outright.
-        int desired = getRequestGroupConnectionWeight(groupToAdd.get());
-        int allowed = std::max(1, maxConcurrentDownloadsPerDomain_ - used);
-        connectionWeight = std::min(desired, allowed);
-        if (connectionWeight < desired) {
-          // numConcurrentCommand_ is what createInitialCommand() actually
-          // reads to decide how many connections to open -- it was cached
-          // from PREF_SPLIT in the RequestGroup constructor, so merely
-          // rewriting the Option here (kept below for consistency/anything
-          // else that reads it back, e.g. getRequestGroupConnectionWeight
-          // on completion) would silently have no effect on the real
-          // connection count without also updating this directly.
-          groupToAdd->setNumConcurrentCommand(connectionWeight);
-          const auto& groupOption = groupToAdd->getOption();
-          groupOption->put(PREF_SPLIT, util::itos(connectionWeight));
-          groupOption->put(PREF_MAX_CONNECTION_PER_SERVER,
-                           util::itos(connectionWeight));
-          A2_LOG_WARN(fmt("Capping connections for domain=%s gid=%s: "
-                          "wanted %d, granted %d (domain budget=%d, %d already in use)",
-                          domain.c_str(),
-                          GroupId::toHex(groupToAdd->getGID()).c_str(), desired,
-                          connectionWeight, maxConcurrentDownloadsPerDomain_,
-                          used));
+      }
+      // FXPlayer extension: video-boundary gap. `parentIdentity` is the same identity used
+      // elsewhere for a merge job's children (RequestGroup::belongsTo()) -- 0 for a group that
+      // isn't part of a multi-segment merge (e.g. a single-URL aux job), in which case its own
+      // GID stands in as a unique identity so it's still correctly treated as "a different video"
+      // from whatever merge job preceded it.
+      auto gapIt = domainVideoGapOverrides_.find(pacingDomain);
+      if (gapIt != domainVideoGapOverrides_.end()) {
+        a2_gid_t parentIdentity =
+            groupToAdd->belongsTo() ? groupToAdd->belongsTo() : groupToAdd->getGID();
+        auto vidIt = fxVideoIdentityByParent_.find(parentIdentity);
+        if (vidIt != fxVideoIdentityByParent_.end()) {
+          parentIdentity = vidIt->second;   // same video as an earlier job (playlist/aux) -- no new gap
+        }
+        auto gapMemo = gapDeferred.find(pacingDomain);
+        if (gapMemo != gapDeferred.end() && gapMemo->second.count(parentIdentity) > 0) {
+          pending.push_back(groupToAdd);
+          continue;
+        }
+        auto& state = domainVideoGapState_[pacingDomain];
+        const bool isNewVideoBoundary =
+            state.lastParent != 0 && state.lastParent != parentIdentity;
+        // The gap is the pause AFTER the previous video's last request. While the domain's
+        // connection cap is still full (the previous video is still downloading), don't start
+        // the clock -- otherwise it runs out mid-download, and gets re-rolled and re-logged every
+        // time the cap check below defers this group again.
+        const int gapCap = effectiveDomainConnectionCap(pacingDomain);
+        if (isNewVideoBoundary && gapCap > 0) {
+          auto dit = activeConnectionsByDomain_.find(pacingDomain);
+          if (dit != activeConnectionsByDomain_.end() && dit->second >= gapCap) {
+            gapDeferred[pacingDomain].insert(parentIdentity);
+            pending.push_back(groupToAdd);
+            continue;
+          }
+        }
+        if (isNewVideoBoundary) {
+          if (!state.gapPending) {
+            // First time this boundary is being evaluated -- roll the random gap ONCE and
+            // remember it, rather than re-rolling (and potentially shrinking) it every recheck.
+            const int span = gapIt->second.maxMs - gapIt->second.minMs;
+            const int gapMs = gapIt->second.minMs +
+                              static_cast<int>(SimpleRandomizer::getInstance()->getRandomNumber(
+                                  span + 1));
+            state.deadline = Timer();
+            state.deadline.advance(std::chrono::milliseconds(gapMs));
+            state.gapPending = true;
+            A2_LOG_WARN(fmt("[fx-video-gap] domain=%s new video; pausing %dms before its first request",
+                            pacingDomain.c_str(), gapMs));
+          }
+          if (Timer() < state.deadline) {
+            gapDeferred[pacingDomain].insert(parentIdentity);
+            pending.push_back(groupToAdd);
+            continue;
+          }
+          // gapPending stays set until a group is actually admitted (cleared there), so a
+          // later volume-budget/cap deferral doesn't roll a second gap for the same boundary.
         }
       }
+      if (laterDeferred.count(pacingDomain) > 0) {
+        pending.push_back(groupToAdd);
+        continue;
+      }
+      // FXPlayer extension: rolling volume budget -- see domainVolumeBudgetOverrides_'s own doc
+      // comment. Purges entries older than the window on every check (cheap: capped at `count`
+      // entries) rather than on a separate timer, so it's always accurate at decision time.
+      auto vbIt = domainVolumeBudgetOverrides_.find(pacingDomain);
+      if (vbIt != domainVolumeBudgetOverrides_.end()) {
+        auto& log = domainVolumeBudgetLog_[pacingDomain];
+        const auto now = std::chrono::system_clock::now();
+        while (!log.empty() && now - log.front() >= vbIt->second.window) {
+          log.pop_front();
+        }
+        // Plus the app's own in-app admissions in the same window (see domainVolumeBudgetExternal_).
+        int external = 0;
+        auto extIt = domainVolumeBudgetExternal_.find(pacingDomain);
+        if (extIt != domainVolumeBudgetExternal_.end()) {
+          auto& ext = extIt->second;
+          while (!ext.empty() && now - ext.front() >= vbIt->second.window) {
+            ext.pop_front();
+          }
+          external = static_cast<int>(ext.size());
+        }
+        if (static_cast<int>(log.size()) + external >= vbIt->second.count) {
+          if (loggedThrottledDomains_.insert("volume:" + pacingDomain).second) {
+            A2_LOG_WARN(fmt("[fx-volume-budget] domain=%s at cap (%d daemon + %d app admissions >= %d in "
+                            "trailing %llds); deferring further segments until the window frees up",
+                            pacingDomain.c_str(), static_cast<int>(log.size()), external,
+                            vbIt->second.count,
+                            static_cast<long long>(vbIt->second.window.count())));
+          }
+          laterDeferred.insert(pacingDomain);
+          pending.push_back(groupToAdd);
+          continue;
+        }
+        loggedThrottledDomains_.erase("volume:" + pacingDomain);
+      }
+    }
+    int effectiveCap = domain.empty() ? 0 : effectiveDomainConnectionCap(domain);
+    if (effectiveCap > 0) {
+      auto dit = activeConnectionsByDomain_.find(domain);
+      int used = dit == activeConnectionsByDomain_.end() ? 0 : dit->second;
+      if (used >= effectiveCap) {
+        if (loggedThrottledDomains_.insert(domain).second) {
+          A2_LOG(throttleLogLevel(effectiveCap),
+                 fmt("Throttling started for domain=%s: "
+                     "%d connections active >= effective-per-domain-cap=%d",
+                     domain.c_str(), used, effectiveCap));
+        }
+        laterDeferred.insert(domain);
+        pending.push_back(groupToAdd);
+        continue;
+      }
+      // Admit, but clamp this download's own connection fan-out so it
+      // (plus whatever else is already active for this domain) doesn't
+      // exceed the configured budget. A single fast/small download isn't
+      // worth reserving its full split/max-connection-per-server for --
+      // clamp down to whatever headroom is left, with a floor of 1 so a
+      // download is never starved outright.
+      int desired = getRequestGroupConnectionWeight(groupToAdd.get());
+      int allowed = std::max(1, effectiveCap - used);
+      connectionWeight = std::min(desired, allowed);
+      if (connectionWeight < desired) {
+        // numConcurrentCommand_ is what createInitialCommand() actually
+        // reads to decide how many connections to open -- it was cached
+        // from PREF_SPLIT in the RequestGroup constructor, so merely
+        // rewriting the Option here (kept below for consistency/anything
+        // else that reads it back, e.g. getRequestGroupConnectionWeight
+        // on completion) would silently have no effect on the real
+        // connection count without also updating this directly.
+        groupToAdd->setNumConcurrentCommand(connectionWeight);
+        const auto& groupOption = groupToAdd->getOption();
+        groupOption->put(PREF_SPLIT, util::itos(connectionWeight));
+        groupOption->put(PREF_MAX_CONNECTION_PER_SERVER,
+                         util::itos(connectionWeight));
+        A2_LOG_WARN(fmt("Capping connections for domain=%s gid=%s: "
+                        "wanted %d, granted %d (domain budget=%d, %d already in use)",
+                        domain.c_str(),
+                        GroupId::toHex(groupToAdd->getGID()).c_str(), desired,
+                        connectionWeight, effectiveCap,
+                        used));
+      }
+    }
+    else {
+      domain.clear();
     }
     // Drop pieceStorage here because paused download holds its
     // reference.
@@ -610,8 +785,35 @@ void RequestGroupMan::fillRequestGroupFromReserver(DownloadEngine* e)
     groupToAdd->setRequestGroupMan(this);
     groupToAdd->setState(RequestGroup::STATE_ACTIVE);
     ++numActive_;
+    groupToAdd->setAdmittedConnectionBudget(domain, domain.empty() ? 0 : connectionWeight);
     if (!domain.empty()) {
       activeConnectionsByDomain_[domain] += connectionWeight;
+    }
+    if (!pacingDomain.empty() &&
+        effectiveDomainMinAdmissionInterval(pacingDomain).count() > 0) {
+      domainLastAdmissionAt_[pacingDomain] = Timer();
+    }
+    if (!pacingDomain.empty()) {
+      if (domainVideoGapOverrides_.count(pacingDomain) > 0) {
+        a2_gid_t admittedIdentity =
+            groupToAdd->belongsTo() ? groupToAdd->belongsTo() : groupToAdd->getGID();
+        auto vidIt = fxVideoIdentityByParent_.find(admittedIdentity);
+        if (vidIt != fxVideoIdentityByParent_.end()) {
+          admittedIdentity = vidIt->second;
+        }
+        auto& gapState = domainVideoGapState_[pacingDomain];
+        gapState.lastParent = admittedIdentity;
+        gapState.gapPending = false;
+      }
+      const bool budgeted = domainVolumeBudgetOverrides_.count(pacingDomain) > 0;
+      if (budgeted) {
+        domainVolumeBudgetLog_[pacingDomain].push_back(std::chrono::system_clock::now());
+        persistDomainVolumeBudgetState();
+      }
+      // Stands for its first HTTP request; later ones count themselves (fxNoteHttpRequest).
+      groupToAdd->setFxAdmissionCounted(budgeted);
+      // This domain's state just changed: nothing memoized about it this pass holds any more.
+      gapDeferred.erase(pacingDomain);
     }
     requestGroups_.push_back(groupToAdd->getGID(), groupToAdd);
     try {
@@ -967,6 +1169,10 @@ RequestGroupMan::findDownloadResult(a2_gid_t gid) const
 
 bool RequestGroupMan::removeDownloadResult(a2_gid_t gid)
 {
+  // A group still running or queued under this gid reports (and may be serialized) later: keep it marked.
+  if (!requestGroups_.get(gid) && !reservedGroups_.get(gid)) {
+    rpc::fxForgetMergeChild(gid);
+  }
   return downloadResults_.remove(gid);
 }
 
@@ -980,13 +1186,17 @@ void RequestGroupMan::addDownloadResult(
     // Save last encountered error code so that we can report it
     // later.
     const auto& dr = downloadResults_[0];
+    // FXPlayer (2026-11-14): a merge child's result is never saved (SessionSerializer skips merge children), so it
+    // is not kept as an unfinished result either, and its gid leaves the merge-child set with it.
+    const a2_gid_t evictedGid = dr->gid->getNumericId();
+    const bool mergeChild = rpc::fxIsMergeChild(evictedGid);
     if (dr->belongsTo == 0 && dr->result != error_code::FINISHED) {
       removedLastErrorResult_ = dr->result;
       ++removedErrorResult_;
 
       // Keep unfinished download result, so that we can save them by
       // SessionSerializer.
-      if (option_->getAsBool(PREF_KEEP_UNFINISHED_DOWNLOAD_RESULT)) {
+      if (!mergeChild && option_->getAsBool(PREF_KEEP_UNFINISHED_DOWNLOAD_RESULT)) {
         if (dr->result != error_code::REMOVED ||
             dr->option->getAsBool(PREF_FORCE_SAVE)) {
           unfinishedDownloadResults_.push_back(dr);
@@ -994,10 +1204,19 @@ void RequestGroupMan::addDownloadResult(
       }
     }
     downloadResults_.pop_front();
+    if (mergeChild) {
+      rpc::fxForgetMergeChild(evictedGid);
+    }
   }
 }
 
-void RequestGroupMan::purgeDownloadResult() { downloadResults_.clear(); }
+void RequestGroupMan::purgeDownloadResult()
+{
+  for (const auto& dr : downloadResults_) {
+    rpc::fxForgetMergeChild(dr->gid->getNumericId());
+  }
+  downloadResults_.clear();
+}
 
 std::shared_ptr<ServerStat>
 RequestGroupMan::findServerStat(const std::string& hostname,
@@ -1110,6 +1329,490 @@ void RequestGroupMan::initWrDiskCache()
   }
 }
 
+void RequestGroupMan::setDomainConnectionCapOverride(const std::string& domain,
+                                                      int cap)
+{
+  // Normalize to lower-case here, at the single point every override enters the map, so it
+  // always matches effectiveDomainConnectionCap's lookup key -- which is always
+  // getRequestGroupDomain()'s result, itself lower-cased (see its own util::toLower call). The
+  // RPC caller's domain string (JSON from the app, ultimately a URL host) isn't guaranteed to
+  // already be lower-case, and a mismatch here wouldn't error -- it would just silently miss the
+  // override and fall back to the global default, defeating the whole point of a tighter
+  // per-domain cap (e.g. XNXX's) without any visible symptom.
+  auto normalized = normalizeDomainKey(domain);
+  // Logged (any domain, INFO) only when the registration changes the map: every addMerge re-sends the same caps.
+  // (2026-11-14: was the temporary XNXX-only "[fx-cap-diag]" WARN line.)
+  auto existingCap = domainConnectionCapOverrides_.find(normalized);
+  const bool changes = cap <= 0 ? existingCap != domainConnectionCapOverrides_.end()
+                                : (existingCap == domainConnectionCapOverrides_.end() ||
+                                   existingCap->second != cap);
+  if (!changes) {
+    return;
+  }
+  A2_LOG_INFO(fmt("[fx-cap] domain=%s cap=%d", normalized.c_str(), cap));
+  ++fxDomainKeyGeneration_;
+  if (cap <= 0) {
+    domainConnectionCapOverrides_.erase(normalized);
+  }
+  else {
+    domainConnectionCapOverrides_[normalized] = cap;
+  }
+}
+
+namespace {
+// '*'-only glob match (no other metacharacters), case already normalized by the caller.
+bool globMatchStar(const std::string& pattern, const std::string& text)
+{
+  size_t p = 0, t = 0, star = std::string::npos, mark = 0;
+  while (t < text.size()) {
+    if (p < pattern.size() && pattern[p] == '*') {
+      star = p++;
+      mark = t;
+    }
+    else if (p < pattern.size() && pattern[p] == text[t]) {
+      ++p;
+      ++t;
+    }
+    else if (star != std::string::npos) {
+      p = star + 1;
+      t = ++mark;
+    }
+    else {
+      return false;
+    }
+  }
+  while (p < pattern.size() && pattern[p] == '*') {
+    ++p;
+  }
+  return p == pattern.size();
+}
+
+// A budget-key pattern may list alternatives separated by '|' (2026-11-08) -- e.g.
+// "hls*.xvideos-cdn.com|hls*.red-cdn.com", so one service whose media lives on two CDN domains
+// (XVideos: free site + Premium) gets ONE cap, ONE pacing clock and ONE volume budget. A pattern
+// with no '|' behaves exactly as before.
+bool globMatchAny(const std::string& pattern, const std::string& text)
+{
+  size_t start = 0;
+  while (true) {
+    const size_t bar = pattern.find('|', start);
+    const std::string alt = pattern.substr(start, bar == std::string::npos ? std::string::npos : bar - start);
+    if (!alt.empty() && globMatchStar(alt, text)) {
+      return true;
+    }
+    if (bar == std::string::npos) {
+      return false;
+    }
+    start = bar + 1;
+  }
+}
+
+// CDN domains used only by services the app paces (XNXX; XVideos and its Premium CDN, 2026-11-08).
+// A host on one of them that misses every registered override still gets a conservative cap/pacing.
+bool isFxPacedCdnHost(const std::string& domain)
+{
+  static const char* const suffixes[] = {".xnxx-cdn.com", ".xvideos-cdn.com", ".red-cdn.com"};
+  for (const char* suffix : suffixes) {
+    const size_t n = std::strlen(suffix);
+    if (domain.size() >= n && domain.compare(domain.size() - n, n, suffix) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+} // namespace
+
+std::string RequestGroupMan::resolveDomainBudgetKey(const std::string& domain) const
+{
+  if (domain.empty()) {
+    return domain;
+  }
+  for (const auto& entry : domainConnectionCapOverrides_) {
+    if (entry.first.find('*') != std::string::npos &&
+        globMatchAny(entry.first, domain)) {
+      return entry.first;
+    }
+  }
+  for (const auto& entry : domainMinAdmissionIntervalOverrides_) {
+    if (entry.first.find('*') != std::string::npos &&
+        globMatchAny(entry.first, domain)) {
+      return entry.first;
+    }
+  }
+  return domain;
+}
+
+int RequestGroupMan::effectiveDomainConnectionCap(const std::string& domain) const
+{
+  auto it = domainConnectionCapOverrides_.find(domain);
+  if (it != domainConnectionCapOverrides_.end()) {
+    return it->second;
+  }
+  // FXPlayer fail-safe (2026-09-28): `domain` here is already resolveDomainBudgetKey()'s result --
+  // which only maps a KNOWN wildcard override pattern back to itself; it does NOT generically catch
+  // a host that merely LOOKS like it should match one. If a NEW xnxx-cdn.com host ever appears that
+  // isn't (yet, or due to a bug in the override-registration plumbing above) covered by an explicit
+  // override, this used to silently fall through to maxConcurrentDownloadsPerDomain_ -- a much more
+  // permissive value meant for well-behaved CDNs in general, not XNXX's own intentionally-tight
+  // policy. Confirmed live 2026-09-28: hls-gcore.xnxx-cdn.com, a gold-tier host not seen before that
+  // session, ran at this generic default (effectiveCap=4, ~137 req/min at peak) despite the
+  // "hls*.xnxx-cdn.com" wildcard override that was SUPPOSED to cover any hls-prefixed host on this
+  // domain -- root cause of why the override didn't apply not yet found (see the app repo's own
+  // notes on this investigation). xnxx-cdn.com is XNXX's own CDN domain exclusively -- no other
+  // service's traffic ever touches it -- so it's safe to hard-code the SAME conservative cap XNXX's
+  // own override mechanism already intends for the whole domain family here, as a fail-safe below
+  // that mechanism that doesn't depend on it having registered anything correctly for this host.
+  // 2026-11-08: XVideos' CDNs (*.xvideos-cdn.com, Premium *.red-cdn.com) get the same fail-safe.
+  if (isFxPacedCdnHost(domain)) {
+    return 1;
+  }
+  return maxConcurrentDownloadsPerDomain_;
+}
+
+void RequestGroupMan::setDomainMinAdmissionIntervalOverride(
+    const std::string& domain, std::chrono::milliseconds interval)
+{
+  // Same normalization rationale as setDomainConnectionCapOverride above.
+  auto normalized = normalizeDomainKey(domain);
+  auto existing = domainMinAdmissionIntervalOverrides_.find(normalized);
+  if (interval.count() <= 0) {
+    if (existing != domainMinAdmissionIntervalOverrides_.end()) {
+      domainMinAdmissionIntervalOverrides_.erase(existing);
+      ++fxDomainKeyGeneration_;
+    }
+  }
+  else if (existing == domainMinAdmissionIntervalOverrides_.end()) {
+    domainMinAdmissionIntervalOverrides_[normalized] = interval;
+    ++fxDomainKeyGeneration_;
+  }
+  else {
+    existing->second = interval; // same key set: cached keys stay valid
+  }
+}
+
+std::chrono::milliseconds RequestGroupMan::effectiveDomainMinAdmissionInterval(
+    const std::string& domain) const
+{
+  auto it = domainMinAdmissionIntervalOverrides_.find(domain);
+  if (it != domainMinAdmissionIntervalOverrides_.end()) {
+    return it->second;
+  }
+  // FXPlayer fail-safe (2026-10-04): mirrors effectiveDomainConnectionCap's *.xnxx-cdn.com fail-safe. The cap
+  // already falls back to 1 for an unregistered XNXX CDN host, but pacing had NO equivalent, so a host that
+  // misses every override ran at full speed. 2026-09-28: hls-gcore.xnxx-cdn.com ran ~137 req/min this way.
+  // Prefer the interval the app registered for the HLS wildcard family; if nothing is registered, use a
+  // conservative floor (about 20 req/min) rather than no pacing at all.
+  // 2026-11-08: also XVideos' CDNs (see isFxPacedCdnHost).
+  static const std::chrono::milliseconds xnxxUnregisteredFloor(3000);
+  if (isFxPacedCdnHost(domain)) {
+    for (const auto& entry : domainMinAdmissionIntervalOverrides_) {
+      if (entry.first.find('*') != std::string::npos && globMatchAny(entry.first, domain)) {
+        return entry.second;
+      }
+    }
+    return xnxxUnregisteredFloor;
+  }
+  return std::chrono::milliseconds(0);
+}
+
+bool RequestGroupMan::hasActiveDomainMinAdmissionIntervalOverrides() const
+{
+  return !domainMinAdmissionIntervalOverrides_.empty();
+}
+
+std::string RequestGroupMan::volumeBudgetStatePath() const
+{
+  if (!option_) {
+    return std::string();
+  }
+  const std::string& sessionPath = option_->get(PREF_SAVE_SESSION);
+  if (sessionPath.empty()) {
+    return std::string();
+  }
+  return util::applyDir(File(sessionPath).getDirname(), "fx-volume-budget.dat");
+}
+
+void RequestGroupMan::loadDomainVolumeBudgetState(const std::string& domain,
+                                                   std::chrono::seconds window)
+{
+  // No-op after the first call for this domain -- see loadedVolumeBudgetDomains_'s own comment.
+  if (!loadedVolumeBudgetDomains_.insert(domain).second) {
+    return;
+  }
+  const auto path = volumeBudgetStatePath();
+  if (path.empty()) {
+    A2_LOG_WARN(fmt("[fx-volume-budget] no --save-session configured; the volume budget for "
+                    "domain=%s will not survive a daemon restart",
+                    domain.c_str()));
+    return;
+  }
+  std::ifstream in(path);
+  if (!in) {
+    return; // Nothing persisted yet -- a fresh budget, not an error.
+  }
+  const auto now = std::chrono::system_clock::now();
+  // A combined key ("a|b|c", 2026-11-11: XNXX + XVideos share one budget) also takes over the history of any
+  // older key all of whose alternatives it covers ("hls*.xnxx-cdn.com", "hls*.xvideos-cdn.com|hls*.red-cdn.com",
+  // an exact "mp4-cdn77.xnxx-cdn.com"), so switching to it neither loses nor double-counts what was already sent.
+  // Those keys are then marked loaded, so the next persist drops their lines instead of copying them over.
+  auto coveredBy = [&domain](const std::string& other) {
+    if (other == domain || domain.find('|') == std::string::npos) {
+      return false;
+    }
+    size_t start = 0;
+    while (true) {
+      const size_t bar = other.find('|', start);
+      const std::string alt = other.substr(start, bar == std::string::npos ? std::string::npos : bar - start);
+      if (alt.empty() || !globMatchAny(domain, alt)) {
+        return false;
+      }
+      if (bar == std::string::npos) {
+        return true;
+      }
+      start = bar + 1;
+    }
+  };
+  std::deque<std::chrono::system_clock::time_point> log;
+  std::vector<std::string> mergedKeys;
+  bool found = false;
+  std::string line;
+  while (std::getline(in, line)) {
+    std::istringstream iss(line);
+    std::string lineDomain;
+    if (!(iss >> lineDomain)) {
+      continue;
+    }
+    const bool own = lineDomain == domain;
+    if (!own && !coveredBy(lineDomain)) {
+      continue;
+    }
+    if (!own) {
+      if (loadedVolumeBudgetDomains_.count(lineDomain) > 0) {
+        continue; // already live under its own key this run
+      }
+      loadedVolumeBudgetDomains_.insert(lineDomain);
+      mergedKeys.push_back(lineDomain);
+    }
+    found = true;
+    long long epochSeconds;
+    while (iss >> epochSeconds) {
+      auto tp = std::chrono::system_clock::time_point(std::chrono::seconds(epochSeconds));
+      // Skip entries already outside the window instead of loading then immediately purging them.
+      if (now < tp || now - tp < window) {
+        log.push_back(tp);
+      }
+    }
+  }
+  if (!found) {
+    return;
+  }
+  std::sort(log.begin(), log.end());
+  domainVolumeBudgetLog_[domain] = std::move(log);
+  std::string merged;
+  for (const auto& k : mergedKeys) {
+    merged += (merged.empty() ? "" : ",") + k;
+  }
+  A2_LOG_WARN(fmt("[fx-volume-budget] restored domain=%s admissions=%lu from %s%s%s",
+                  domain.c_str(),
+                  static_cast<unsigned long>(domainVolumeBudgetLog_[domain].size()),
+                  path.c_str(), merged.empty() ? "" : " (merged from ", merged.empty() ? "" : (merged + ")").c_str()));
+}
+
+std::vector<int64_t>
+RequestGroupMan::getDomainVolumeBudgetAdmissions(const std::string& domain,
+                                                 std::chrono::seconds window)
+{
+  loadDomainVolumeBudgetState(domain, window);
+  std::vector<int64_t> out;
+  auto it = domainVolumeBudgetLog_.find(domain);
+  if (it == domainVolumeBudgetLog_.end()) {
+    return out;
+  }
+  const auto now = std::chrono::system_clock::now();
+  for (const auto& tp : it->second) {
+    if (now < tp || now - tp < window) {
+      out.push_back(std::chrono::duration_cast<std::chrono::seconds>(tp.time_since_epoch()).count());
+    }
+  }
+  return out;
+}
+
+int RequestGroupMan::getDomainVolumeBudgetCount(const std::string& domain) const
+{
+  auto it = domainVolumeBudgetOverrides_.find(domain);
+  return it == domainVolumeBudgetOverrides_.end() ? 0 : it->second.count;
+}
+
+void RequestGroupMan::persistDomainVolumeBudgetState() const
+{
+  const auto path = volumeBudgetStatePath();
+  if (path.empty()) {
+    return;
+  }
+  const auto tmpPath = path + ".tmp";
+  {
+    std::ofstream out(tmpPath, std::ios::trunc);
+    if (!out) {
+      A2_LOG_WARN(fmt("[fx-volume-budget] failed to open %s for writing", tmpPath.c_str()));
+      return;
+    }
+    // Domains whose history this run hasn't loaded yet are copied over unchanged (2026-11-08): writing only the
+    // in-memory map dropped them, so e.g. using XVideos first after a restart erased XNXX's budget history.
+    {
+      std::ifstream in(path);
+      std::string line;
+      while (in && std::getline(in, line)) {
+        std::istringstream iss(line);
+        std::string lineDomain;
+        if ((iss >> lineDomain) && loadedVolumeBudgetDomains_.count(lineDomain) == 0 &&
+            domainVolumeBudgetLog_.count(lineDomain) == 0) {
+          out << line << '\n';
+        }
+      }
+    }
+    for (const auto& entry : domainVolumeBudgetLog_) {
+      out << entry.first;
+      for (const auto& tp : entry.second) {
+        out << ' '
+            << std::chrono::duration_cast<std::chrono::seconds>(tp.time_since_epoch()).count();
+      }
+      out << '\n';
+    }
+    // Flush and close here, so a failed final write is seen (2026-11-14 review: the check ran before the stream's
+    // destructor flushed, so a flush failure went unnoticed).
+    out.close();
+    if (!out) {
+      A2_LOG_WARN(fmt("[fx-volume-budget] failed to write %s", tmpPath.c_str()));
+      return;
+    }
+  }
+  // Durable before the rename (2026-11-14 review): after a power loss the renamed file could come back empty, losing
+  // the budget history — and the daemon then fails open and over-sends.
+  {
+    int fd = open(tmpPath.c_str(), O_RDONLY);
+    if (fd != -1) {
+      fsync(fd);
+      close(fd);
+    }
+  }
+  if (!File(tmpPath).renameTo(path)) {
+    A2_LOG_WARN(fmt("[fx-volume-budget] failed to publish %s", path.c_str()));
+  }
+}
+
+void RequestGroupMan::setDomainVolumeBudgetOverride(const std::string& domain, int count,
+                                                     std::chrono::seconds window)
+{
+  auto normalized = normalizeDomainKey(domain);
+  if (count <= 0) {
+    domainVolumeBudgetOverrides_.erase(normalized);
+    return;
+  }
+  // Load any persisted log BEFORE installing the override, so the very first admission check
+  // against it sees restart-surviving history rather than an empty log.
+  loadDomainVolumeBudgetState(normalized, window);
+  domainVolumeBudgetOverrides_[normalized] = VolumeBudget{count, window};
+}
+
+namespace {
+// How many merge parents' video identities are remembered; the oldest goes first. Far more than can be queued at
+// once, so only a long-finished job's identity is ever dropped.
+const size_t FX_MAX_VIDEO_IDENTITIES = 4096;
+} // namespace
+
+void RequestGroupMan::setFxVideoIdentity(a2_gid_t parentGid, const std::string& videoGroup)
+{
+  if (videoGroup.empty()) {
+    return;
+  }
+  // Nonzero so it never reads as "no previous video" (VideoGapState::lastParent == 0).
+  const auto identity = static_cast<a2_gid_t>(std::hash<std::string>{}(videoGroup)) | 1;
+  if (fxVideoIdentityByParent_.emplace(parentGid, identity).second) {
+    fxVideoIdentityOrder_.push_back(parentGid);
+  }
+  else {
+    fxVideoIdentityByParent_[parentGid] = identity;
+  }
+  while (fxVideoIdentityOrder_.size() > FX_MAX_VIDEO_IDENTITIES) {
+    fxVideoIdentityByParent_.erase(fxVideoIdentityOrder_.front());
+    fxVideoIdentityOrder_.pop_front();
+  }
+}
+
+void RequestGroupMan::setDomainVolumeBudgetExternal(
+    const std::string& domain, std::vector<std::chrono::system_clock::time_point> admissions)
+{
+  auto normalized = normalizeDomainKey(domain);
+  if (admissions.empty()) {
+    domainVolumeBudgetExternal_.erase(normalized);
+    return;
+  }
+  std::sort(admissions.begin(), admissions.end());
+  A2_LOG_INFO(fmt("[fx-volume-budget] domain=%s external (app) admissions=%lu",
+                  normalized.c_str(), static_cast<unsigned long>(admissions.size())));
+  domainVolumeBudgetExternal_[normalized] =
+      std::deque<std::chrono::system_clock::time_point>(admissions.begin(), admissions.end());
+}
+
+bool RequestGroupMan::hasActiveDomainVolumeBudgetOverrides() const
+{
+  return !domainVolumeBudgetOverrides_.empty();
+}
+
+void RequestGroupMan::setDomainVideoGapOverride(const std::string& domain, int minMs, int maxMs)
+{
+  auto normalized = normalizeDomainKey(domain);
+  if (maxMs <= 0) {
+    domainVideoGapOverrides_.erase(normalized);
+    domainVideoGapState_.erase(normalized);
+    return;
+  }
+  minMs = std::max(0, minMs);
+  domainVideoGapOverrides_[normalized] = VideoGap{std::min(minMs, maxMs), maxMs};
+}
+
+bool RequestGroupMan::hasActiveDomainVideoGapOverrides() const
+{
+  return !domainVideoGapOverrides_.empty();
+}
+
+std::string RequestGroupMan::cachedRequestGroupDomainKey(RequestGroup* group) const
+{
+  const auto& dctx = group->getDownloadContext();
+  const auto& fileEntry = dctx ? dctx->getFirstFileEntry() : nullptr;
+  if (!fileEntry) {
+    return resolveDomainBudgetKey(getRequestGroupDomain(group));
+  }
+  const auto& spent = fileEntry->getSpentUris();
+  const auto& remaining = fileEntry->getRemainingUris();
+  if (spent.empty() && remaining.empty()) {
+    return resolveDomainBudgetKey(getRequestGroupDomain(group));
+  }
+  // The same URI getRequestGroupDomain() reads.
+  const std::string& uri = spent.empty() ? remaining.front() : spent.front();
+  if (const auto* key = group->getFxCachedDomainKey(uri, fxDomainKeyGeneration_)) {
+    return *key;
+  }
+  auto key = resolveDomainBudgetKey(getRequestGroupDomain(group));
+  group->setFxCachedDomainKey(uri, key, fxDomainKeyGeneration_);
+  return key;
+}
+
+void RequestGroupMan::fxNoteHttpRequest(RequestGroup* group, const std::string& host)
+{
+  if (group->takeFxAdmissionCounted() || domainVolumeBudgetOverrides_.empty()) {
+    return;
+  }
+  const auto key = resolveDomainBudgetKey(normalizeDomainKey(host));
+  if (domainVolumeBudgetOverrides_.count(key) == 0) {
+    return;
+  }
+  domainVolumeBudgetLog_[key].push_back(std::chrono::system_clock::now());
+  persistDomainVolumeBudgetState();
+  A2_LOG_INFO(fmt("[fx-volume-budget] domain=%s gid=%s re-request (retry/redirect) counted",
+                  key.c_str(), GroupId::toHex(group->getGID()).c_str()));
+}
+
 std::string RequestGroupMan::getRequestGroupDomain(const RequestGroup* group)
 {
   const auto& dctx = group->getDownloadContext();
@@ -1120,16 +1823,20 @@ std::string RequestGroupMan::getRequestGroupDomain(const RequestGroup* group)
   if (!fileEntry) {
     return std::string();
   }
-  std::vector<std::string> uris = fileEntry->getUris();
-  if (uris.empty()) {
+  // Same element FileEntry::getUris().front() returns (spent URIs first, then remaining), without
+  // copying every URI into a temporary vector -- this runs for every reserved group on every
+  // admission pass (every 250ms while anything is queued).
+  const auto& spent = fileEntry->getSpentUris();
+  const auto& remaining = fileEntry->getRemainingUris();
+  if (spent.empty() && remaining.empty()) {
     return std::string();
   }
-  const std::string& uri = uris.front();
+  const std::string& uri = spent.empty() ? remaining.front() : spent.front();
   uri_split_result us;
   if (uri_split(&us, uri.c_str()) != 0) {
     return std::string();
   }
-  return util::toLower(uri::getFieldString(us, USR_HOST, uri.c_str()));
+  return normalizeDomainKey(uri::getFieldString(us, USR_HOST, uri.c_str()));
 }
 
 int RequestGroupMan::getRequestGroupConnectionWeight(const RequestGroup* group)
@@ -1163,7 +1870,8 @@ void RequestGroupMan::decreaseNumActive(const std::string& domain,
         // of near-identical lines for one continuous throttle episode). Idle is the one signal
         // that's actually "nothing left waiting on this domain."
         if (loggedThrottledDomains_.erase(domain) > 0) {
-          A2_LOG_WARN(fmt("Throttling ended for domain=%s", domain.c_str()));
+          A2_LOG(throttleLogLevel(effectiveDomainConnectionCap(domain)),
+                 fmt("Throttling ended for domain=%s", domain.c_str()));
         }
       }
     }

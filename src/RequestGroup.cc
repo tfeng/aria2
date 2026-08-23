@@ -1331,9 +1331,8 @@ void RequestGroup::enableSeedOnly()
   if (requestGroupMan_) {
     seedOnly_ = true;
 
-    requestGroupMan_->decreaseNumActive(
-        RequestGroupMan::getRequestGroupDomain(this),
-        RequestGroupMan::getRequestGroupConnectionWeight(this));
+    auto budget = takeAdmittedConnectionBudget();
+    requestGroupMan_->decreaseNumActive(budget.first, budget.second);
     requestGroupMan_->requestQueueCheck();
   }
 }

@@ -40,6 +40,7 @@
 #include <set>
 
 #include "RequestGroupMan.h"
+#include "RpcMethodImpl.h"
 #include "a2functional.h"
 #include "File.h"
 #include "A2STR.h"
@@ -281,6 +282,9 @@ bool saveDownloadResult(IOFile& fp, std::set<a2_gid_t>& metainfoCache,
 {
   for (; first != last; ++first) {
     const auto& dr = *first;
+    if (rpc::fxIsMergeChild(dr->gid->getNumericId())) {
+      continue;   // FXPlayer: merge children are never persisted -- see rpc::fxIsMergeChild
+    }
     auto save = false;
     switch (dr->result) {
     case error_code::FINISHED:
@@ -327,6 +331,9 @@ bool SessionSerializer::save(IOFile& fp) const
     // Save active downloads.
     const RequestGroupList& groups = rgman_->getRequestGroups();
     for (const auto& rg : groups) {
+      if (rpc::fxIsMergeChild(rg->getGID())) {
+        continue;   // FXPlayer: see rpc::fxIsMergeChild
+      }
       auto dr = rg->createDownloadResult();
       bool stopped = dr->result == error_code::FINISHED ||
                      dr->result == error_code::REMOVED;
@@ -342,6 +349,9 @@ bool SessionSerializer::save(IOFile& fp) const
   if (saveWaiting_) {
     const auto& groups = rgman_->getReservedGroups();
     for (const auto& rg : groups) {
+      if (rpc::fxIsMergeChild(rg->getGID())) {
+        continue;   // FXPlayer: see rpc::fxIsMergeChild
+      }
       auto result = rg->createDownloadResult();
       if (!writeDownloadResult(fp, metainfoCache, result,
                                rg->isPauseRequested())) {

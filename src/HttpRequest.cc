@@ -60,6 +60,7 @@ const std::string HttpRequest::USER_AGENT("aria2");
 
 HttpRequest::HttpRequest()
     : cookieStorage_(nullptr),
+      fxCookiesProvided_(false),
       authConfigFactory_(nullptr),
       option_(nullptr),
       endOffsetOverride_(0),
@@ -230,7 +231,22 @@ std::string HttpRequest::createRequest()
   if (!request_->getReferer().empty()) {
     builtinHds.emplace_back("Referer:", request_->getReferer());
   }
-  if (cookieStorage_) {
+  // FXPlayer extension: when the RPC caller supplied a per-domain cookie map at all (even an
+  // empty one — see fxCookiesProvided_'s own doc comment), it is the SOLE authority for the
+  // Cookie header on every request this HttpRequest represents, keyed by THIS request's own
+  // current host (getHost() — already redirect-correct, same accessor cookieStorage_'s lookup
+  // below uses). A host with no entry in the map gets no Cookie header at all; cookieStorage_
+  // (this daemon's own long-lived cookie jar, shared and accumulated across every download it has
+  // ever run) is never consulted as a fallback in that case. Only when the caller never used this
+  // feature (fxCookiesProvided_ == false) does the pre-existing cookieStorage_ behavior apply,
+  // unchanged, below.
+  if (fxCookiesProvided_) {
+    auto it = fxCookiesByDomain_.find(util::toLower(getHost()));
+    if (it != fxCookiesByDomain_.end() && !it->second.empty()) {
+      builtinHds.emplace_back("Cookie:", it->second);
+    }
+  }
+  else if (cookieStorage_) {
     std::string cookiesValue;
     auto path = getDir();
     path += getFile();
@@ -343,6 +359,15 @@ void HttpRequest::setCookieStorage(CookieStorage* cookieStorage)
 }
 
 CookieStorage* HttpRequest::getCookieStorage() const { return cookieStorage_; }
+
+void HttpRequest::setFxCookiesByDomain(std::map<std::string, std::string> cookiesByDomain)
+{
+  fxCookiesByDomain_.clear();
+  for (auto& entry : cookiesByDomain) {
+    fxCookiesByDomain_[util::toLower(entry.first)] = std::move(entry.second);
+  }
+  fxCookiesProvided_ = true;
+}
 
 void HttpRequest::setAuthConfigFactory(AuthConfigFactory* factory)
 {

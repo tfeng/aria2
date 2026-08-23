@@ -192,6 +192,27 @@ private:
 
   bool seedOnly_;
 
+  // FXPlayer extension: the domain and connection weight this group was COUNTED under in
+  // RequestGroupMan::activeConnectionsByDomain_ at admission time (empty/0 when it was not
+  // counted). Release must subtract exactly this, not a value re-derived from live state: a
+  // later changeUri/changeOption (or a per-domain cap override that appeared after admission)
+  // would otherwise subtract a different weight or hit a different key, leaking or stealing
+  // budget and wedging a cap-1 domain permanently.
+  std::string admittedDomain_;
+  int admittedWeight_ = 0;
+
+  // FXPlayer extension (2026-11-14): RequestGroupMan's admission pass runs for every reserved group every 250 ms
+  // while segments are held; it caches this group's budget key (resolveDomainBudgetKey of its first URI's host)
+  // here instead of re-parsing the URI each time. Valid while the first URI is still fxKeyUri_ and the override
+  // maps the key depends on are unchanged (fxKeyGeneration_ == RequestGroupMan's generation; 0 = never cached).
+  std::string fxKeyUri_;
+  std::string fxDomainKey_;
+  uint64_t fxKeyGeneration_ = 0;
+  // FXPlayer extension (2026-11-14): this group's admission already added one entry to its domain's volume budget,
+  // standing for its first HTTP request; RequestGroupMan::fxNoteHttpRequest consumes it, and counts every later
+  // request (retries, redirects) itself.
+  bool fxAdmissionCounted_ = false;
+
   void validateFilename(const std::string& expectedFilename,
                         const std::string& actualFilename) const;
 
@@ -271,6 +292,40 @@ public:
   void validateTotalLength(int64_t actualTotalLength) const;
 
   void setNumConcurrentCommand(int num) { numConcurrentCommand_ = num; }
+
+  void setAdmittedConnectionBudget(std::string domain, int weight)
+  {
+    admittedDomain_ = std::move(domain);
+    admittedWeight_ = weight;
+  }
+
+  // Returns the recorded budget and clears it, so a second release can never double-subtract.
+  std::pair<std::string, int> takeAdmittedConnectionBudget()
+  {
+    std::pair<std::string, int> r(std::move(admittedDomain_), admittedWeight_);
+    admittedDomain_.clear();
+    admittedWeight_ = 0;
+    return r;
+  }
+
+  const std::string* getFxCachedDomainKey(const std::string& uri, uint64_t generation) const
+  {
+    return generation != 0 && fxKeyGeneration_ == generation && fxKeyUri_ == uri ? &fxDomainKey_ : nullptr;
+  }
+  void setFxCachedDomainKey(const std::string& uri, std::string key, uint64_t generation)
+  {
+    fxKeyUri_ = uri;
+    fxDomainKey_ = std::move(key);
+    fxKeyGeneration_ = generation;
+  }
+  void setFxAdmissionCounted(bool counted) { fxAdmissionCounted_ = counted; }
+  // True once: whether the admission count is still unclaimed (see fxAdmissionCounted_).
+  bool takeFxAdmissionCounted()
+  {
+    const bool counted = fxAdmissionCounted_;
+    fxAdmissionCounted_ = false;
+    return counted;
+  }
 
   int getNumConcurrentCommand() const { return numConcurrentCommand_; }
 
