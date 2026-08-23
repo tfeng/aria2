@@ -163,6 +163,65 @@ public:
   static const char* getMethodName() { return "fxplayer.findMergeByOutput"; }
 };
 
+// FXPlayer extension (item 6, 2026-09-27): reads back a completed merge job's output as text and
+// deletes it -- lets the app fetch a small file (an HLS playlist) through the SAME host/connection
+// its segments come from, by submitting it as an ordinary single-URL fxplayer.addMerge job (concat
+// mode, ephemeral output path) and then calling this instead of leaving the file on disk. See
+// RpcMethodImpl.cc's own comment on the method for the full rationale.
+class FxplayerReadTextOutputRpcMethod : public RpcMethod {
+protected:
+  virtual std::unique_ptr<ValueBase> process(const RpcRequest& req,
+                                             DownloadEngine* e) CXX11_OVERRIDE;
+
+public:
+  static const char* getMethodName() { return "fxplayer.readTextOutput"; }
+};
+
+// FXPlayer extension (2026-11-07): fxplayer.getVolumeBudget(domain, windowSeconds) -> {domain,
+// windowSeconds, count, admissions: [unix seconds, oldest first]} -- the daemon's own rolling volume
+// budget history for one budget key, so the app's pre-submit wait uses the daemon's real count.
+class FxplayerGetVolumeBudgetRpcMethod : public RpcMethod {
+protected:
+  virtual std::unique_ptr<ValueBase> process(const RpcRequest& req,
+                                             DownloadEngine* e) CXX11_OVERRIDE;
+
+public:
+  static const char* getMethodName() { return "fxplayer.getVolumeBudget"; }
+};
+
+// FXPlayer extension (2026-11-11): fxplayer.reportVolume({budgetKey: [unix seconds]}) — the app's own requests
+// (in-app downloads + playback) against a shared volume budget, reported whenever they change.
+class FxplayerReportVolumeRpcMethod : public RpcMethod {
+protected:
+  virtual std::unique_ptr<ValueBase> process(const RpcRequest& req,
+                                             DownloadEngine* e) CXX11_OVERRIDE;
+
+public:
+  static const char* getMethodName() { return "fxplayer.reportVolume"; }
+};
+
+// FXPlayer extension (2026-11-08): fxplayer.stopMerge(gid) -- stop a merge job, keeping its downloaded
+// segments for the save's next attempt. See RpcMethodImpl.cc.
+class FxplayerStopMergeRpcMethod : public RpcMethod {
+protected:
+  virtual std::unique_ptr<ValueBase> process(const RpcRequest& req,
+                                             DownloadEngine* e) CXX11_OVERRIDE;
+
+public:
+  static const char* getMethodName() { return "fxplayer.stopMerge"; }
+};
+
+// FXPlayer extension (2026-11-08): fxplayer.removeMergeOutput(output) -- delete a save's job and every file
+// aria2 kept for it (segments, partial outputs). See RpcMethodImpl.cc.
+class FxplayerRemoveMergeOutputRpcMethod : public RpcMethod {
+protected:
+  virtual std::unique_ptr<ValueBase> process(const RpcRequest& req,
+                                             DownloadEngine* e) CXX11_OVERRIDE;
+
+public:
+  static const char* getMethodName() { return "fxplayer.removeMergeOutput"; }
+};
+
 class RemoveRpcMethod : public RpcMethod {
 protected:
   virtual std::unique_ptr<ValueBase> process(const RpcRequest& req,
@@ -603,6 +662,17 @@ void gatherBitTorrentMetadata(Dict* btDict, TorrentAttribute* torrentAttrs);
 // can advance their stage machine and run merge/remux completion logic.
 void fxMergeOnGroupStopped(const std::shared_ptr<RequestGroup>& group,
                            DownloadEngine* e, error_code::Value result);
+
+// FXPlayer extension (2026-11-08): called for each reserved group about to be admitted; true = drop it
+// (a segment of a failed job, one reused from disk, or one whose signed link already expired).
+bool fxMergeAdmissionCheck(const std::shared_ptr<RequestGroup>& group, DownloadEngine* e);
+
+// FXPlayer extension (2026-11-07): true if `gid` was ever a segment child of an fxplayer.addMerge job in this
+// process. SessionSerializer skips these: a merge job itself is never persisted, so after a restart its
+// children came back as orphan plain downloads -- re-fetching (often expired) CDN URLs that can never be
+// merged, and outside every per-job throttle (pacing/volume budget arrive with each submit, not from the
+// session). The app re-submits lost jobs itself.
+bool fxIsMergeChild(a2_gid_t gid);
 
 } // namespace rpc
 

@@ -61,6 +61,17 @@
 
 namespace aria2 {
 
+namespace {
+// FXPlayer extension (2026-09-10): same host match as HttpRequest.cc's identically-named helper (kept
+// as a separate file-local copy rather than a shared header change, since it's a one-line check used in
+// exactly these two translation units) — see that copy's own doc comment for why a substring match
+// rather than an exact-host allowlist.
+bool isXnxxDiagHost(const std::string& host)
+{
+  return util::toLower(host).find("xnxx") != std::string::npos;
+}
+} // namespace
+
 HttpRequestEntry::HttpRequestEntry(std::unique_ptr<HttpRequest> httpRequest)
     : httpRequest_{std::move(httpRequest)},
       proc_{
@@ -162,6 +173,18 @@ std::unique_ptr<HttpResponse> HttpConnection::receiveResponse()
                   socketRecvBuffer_->getBufferLength())) {
     A2_LOG_INFO(fmt(MSG_RECEIVE_RESPONSE, cuid_,
                     eraseConfidentialInfo(proc->getHeaderString()).c_str()));
+    // FXPlayer extension (2026-09-10): mirrors the outgoing-request diagnostic in HttpRequest.cc's
+    // createRequest() — same reasoning (WARN so it survives normal log-level settings, un-redacted
+    // since this is the user's own private local log). This is the RAW response header block
+    // (status line + every header exactly as the server sent it, including any Set-Cookie, Retry-After,
+    // or CDN/WAF-identifying headers a block/challenge response would carry) — getHeaderString() here,
+    // unlike HttpHeader's own table_, isn't limited to the handful of header names aria2 tokenizes for
+    // its own use.
+    const auto& originatingRequest = outstandingHttpRequests_.front()->getHttpRequest();
+    if (originatingRequest && isXnxxDiagHost(originatingRequest->getHost())) {
+      A2_LOG_WARN(fmt("[xnxx-diag] INCOMING response host=%s\n%s",
+                      originatingRequest->getHost().c_str(), proc->getHeaderString().c_str()));
+    }
     auto result = proc->getResult();
     if (result->getStatusCode() / 100 == 1) {
       socketRecvBuffer_->drain(proc->getLastBytesProcessed());

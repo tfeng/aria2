@@ -365,6 +365,37 @@ extern PrefPtr PREF_ENABLE_HTTP_PIPELINING;
 extern PrefPtr PREF_MAX_HTTP_PIPELINING;
 // value: string
 extern PrefPtr PREF_HEADER;
+// FXPlayer extension: per-domain cookie map for fxplayer.addMerge, so the app can supply a
+// DIFFERENT cookie per request host (e.g. the site's own page domain AND its CDN's domain
+// together) instead of one flat Cookie header applied to every request in the job regardless of
+// which host it actually targets. Serialized as "domain\tcookieValue" lines joined by "\n" (see
+// getFxCookiesFieldAsOptionValue in RpcMethodImpl.cc for the JSON->this encoding, and
+// HttpRequestCommand.cc for the decode). Deliberately a SEPARATE option from PREF_HEADER (not
+// folded into it) so "this option is defined at all" (even with zero domains) can mean "the app
+// is the sole cookie authority for this job" distinctly from "the app didn't send any Cookie
+// header" — see HttpRequest::createRequest's own comment on fxCookiesByDomain_ for why that
+// distinction matters (it's what stops this daemon's own accumulated cookie jar from silently
+// filling in for a domain the app deliberately didn't list).
+// value: string
+extern PrefPtr PREF_FX_COOKIES;
+// FXPlayer extension (2026-09-21): per-job host allowlist for fxplayer.addMerge, so a download
+// job can be restricted to only ever connect to a known-safe set of host suffixes (e.g. a video
+// CDN) and NEVER the site's own main domain — even across an HTTP redirect the daemon follows on
+// its own, which the app has no other way to intercept. Serialized as one suffix per line, joined
+// by "\n" (see getFxAllowedHostSuffixesFieldAsOptionValue in RpcMethodImpl.cc for the JSON->this
+// encoding). Checked in InitiateConnectionCommand — the single chokepoint every connection
+// attempt passes through, including every redirect hop, and strictly before any DNS/socket work —
+// against the CURRENT request target (redirects mutate the Request's host in place, so this
+// re-checks on each hop automatically, not just the job's original URI).
+//
+// Like PREF_FX_COOKIES, "defined at all" (even with an empty list) is deliberately distinct from
+// "not defined": defined means the app is asserting a real allowlist for this job — even a job
+// whose current request happens to have zero configured suffixes must be rejected, not silently
+// let through, since an empty allowlist can only mean an app-side bug, and failing closed is the
+// only safe default for a security control. Not defined (the common case for jobs that don't need
+// this, e.g. XHamster/FapHouse) preserves the pre-existing no-restriction behavior.
+// value: string (see prefs.h for the encoding)
+extern PrefPtr PREF_FX_ALLOWED_HOST_SUFFIXES;
 // value: string that your file system recognizes as a file name.
 extern PrefPtr PREF_CERTIFICATE;
 // value: string that your file system recognizes as a file name.
