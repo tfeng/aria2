@@ -48,6 +48,10 @@ class FillRequestGroupCommand : public Command {
 private:
   DownloadEngine* e_;
   Timer lastExecTime;
+  // FXPlayer extension: a separate timer/poll from lastExecTime above, gated on
+  // RequestGroupMan::hasActiveDomainMinAdmissionIntervalOverrides() -- see execute()'s own
+  // comment for why a pure time-based admission defer needs an explicit re-poll at all.
+  Timer lastPacingRecheckTime_;
 
 public:
   FillRequestGroupCommand(cuid_t cuid, DownloadEngine* e);

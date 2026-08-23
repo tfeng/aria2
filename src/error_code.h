@@ -76,6 +76,9 @@ enum Value {
   JSON_PARSE_ERROR = 30,
   REMOVED = 31,
   CHECKSUM_ERROR = 32,
+  // FXPlayer extension (2026-09-21): a request's target host wasn't in this job's
+  // PREF_FX_ALLOWED_HOST_SUFFIXES allowlist — see InitiateConnectionCommand.cc.
+  FX_HOST_NOT_ALLOWED = 33,
 };
 
 } // namespace error_code

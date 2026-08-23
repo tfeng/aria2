@@ -53,6 +53,8 @@
 #include "SocketRecvBuffer.h"
 #include "BackupIPv4ConnectCommand.h"
 #include "ConnectCommand.h"
+#include "DlAbortEx.h"
+#include "error_code.h"
 
 namespace aria2 {
 
@@ -71,6 +73,66 @@ InitiateConnectionCommand::InitiateConnectionCommand(
 
 InitiateConnectionCommand::~InitiateConnectionCommand() = default;
 
+namespace {
+// FXPlayer extension (2026-09-21): true if `hostname` is exactly `suffix`, or ends with it on a
+// label (dot) boundary — so a configured suffix "xnxx-cdn.com" matches "hls-gold-cdn77.xnxx-cdn.com"
+// but NOT "evilxnxx-cdn.com" (no dot boundary — a naive endsWith would wrongly allow this). Both
+// sides are compared case-insensitively (hostnames are case-insensitive per spec, and PREF_FX_
+// ALLOWED_HOST_SUFFIXES's own doc comment makes no promise the app lower-cases before sending).
+bool fxHostMatchesAllowedSuffix(const std::string& hostname, const std::string& suffix)
+{
+  if (suffix.empty()) {
+    return false;
+  }
+  if (util::strieq(hostname, suffix)) {
+    return true;
+  }
+  return hostname.size() > suffix.size() &&
+         hostname[hostname.size() - suffix.size() - 1] == '.' &&
+         util::iendsWith(hostname, suffix);
+}
+
+// Throws DL_ABORT_EX2 (FX_HOST_NOT_ALLOWED) if `req`'s current target host isn't covered by this
+// request's PREF_FX_ALLOWED_HOST_SUFFIXES, when that option is defined for it. See that pref's own
+// doc comment (prefs.h) for why "defined but empty" must still reject, and
+// InitiateConnectionCommand::executeInternal's call site for why THIS is the chokepoint: every
+// connection attempt — including every hop of an HTTP redirect, which mutates the same Request's
+// host in place and routes back through this exact command (HttpResponse::processRedirect →
+// Request::redirectUri → AbstractCommand::prepareForRetry → CreateRequestCommand →
+// InitiateConnectionCommandFactory) — passes through here strictly before any DNS/socket work.
+void fxEnforceAllowedHost(const Request& req, const std::shared_ptr<Option>& option)
+{
+  if (!option->defined(PREF_FX_ALLOWED_HOST_SUFFIXES)) {
+    return; // job didn't ask for this restriction — pre-existing unrestricted behavior
+  }
+  const std::string& hostname = req.getHost();
+  // Manual line-walk (matches HttpRequestCommand.cc's PREF_FX_COOKIES decode — same "\n"-joined
+  // wire encoding, same style) rather than a generic split helper, so both FXPlayer per-job
+  // extensions decode their shared line-based format identically.
+  const auto& encoded = option->get(PREF_FX_ALLOWED_HOST_SUFFIXES);
+  size_t lineStart = 0;
+  while (lineStart <= encoded.size()) {
+    auto lineEnd = encoded.find('\n', lineStart);
+    if (lineEnd == std::string::npos) {
+      lineEnd = encoded.size();
+    }
+    if (lineEnd > lineStart &&
+        fxHostMatchesAllowedSuffix(hostname, encoded.substr(lineStart, lineEnd - lineStart))) {
+      return; // allowed
+    }
+    if (lineEnd == encoded.size()) {
+      break;
+    }
+    lineStart = lineEnd + 1;
+  }
+  throw DL_ABORT_EX2(
+      fmt("FXPlayer host allowlist: refusing to connect to '%s' - not in this job's "
+          "allowed host suffixes",
+          hostname.c_str()),
+      error_code::FX_HOST_NOT_ALLOWED);
+}
+} // namespace
+
 bool InitiateConnectionCommand::executeInternal()
 {
   std::string hostname;
@@ -84,6 +146,13 @@ bool InitiateConnectionCommand::executeInternal()
     hostname = proxyRequest->getHost();
     port = proxyRequest->getPort();
   }
+  // Checked against the REQUEST's real target (not `hostname`, which is the PROXY's address when
+  // a proxy is configured) — the allowlist is about which resource this job is ultimately
+  // fetching, not which literal TCP peer it connects through. Before any DNS/socket work, and
+  // ahead of the try/catch below so a violation propagates as a clean job/segment failure (like
+  // any other DL_ABORT_EX2, e.g. HttpResponse::validateResponse's Content-Range check) rather than
+  // being treated as a transient connection failure worth retrying via a different cached IP.
+  fxEnforceAllowedHost(*getRequest(), getOption());
   std::vector<std::string> addrs;
   std::string ipaddr = resolveHostname(addrs, hostname, port);
   if (ipaddr.empty()) {

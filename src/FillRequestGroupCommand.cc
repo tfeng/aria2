@@ -93,6 +93,32 @@ bool FillRequestGroupCommand::execute()
     }
   }
 
+  // FXPlayer extension: a domain's minimum-admission-interval defer (see
+  // RequestGroupMan::domainMinAdmissionIntervalOverrides_) has no other event to naturally
+  // re-trigger requestQueueCheck() once it clears -- unlike a connection-cap defer, which the
+  // completing download's own path already re-triggers. Without this poll, the very first
+  // paced defer for a domain whose sole active connection then finishes would hang forever.
+  // Gated on there being reserved (possibly deferred) groups at all, so this costs nothing when
+  // no paced job is pending. The engine's own wait would otherwise sleep up to its default 1s
+  // refresh interval (DownloadEngine.cc's DEFAULT_REFRESH_INTERVAL) between iterations, making
+  // the check above lag by 1-2 ticks -- so also shorten the next wait to the recheck cadence.
+  // Errs toward slightly slower pacing, never faster. Also covers domainVolumeBudgetOverrides_
+  // (an old entry aging out of its window) and domainVideoGapOverrides_ (a boundary's deadline
+  // elapsing) -- both are equally purely time-based releases with nothing else to re-poll them.
+  if ((rgman->hasActiveDomainMinAdmissionIntervalOverrides() ||
+       rgman->hasActiveDomainVolumeBudgetOverrides() ||
+       rgman->hasActiveDomainVideoGapOverrides()) &&
+      !rgman->getReservedGroups().empty()) {
+    constexpr auto pacingRecheck = std::chrono::milliseconds(250);
+    const auto& now = global::wallclock();
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(
+            lastPacingRecheckTime_.difference(now)) >= pacingRecheck) {
+      lastPacingRecheckTime_ = now;
+      rgman->requestQueueCheck();
+    }
+    e_->setRefreshInterval(pacingRecheck);
+  }
+
   return false;
 }
 

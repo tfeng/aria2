@@ -55,6 +55,7 @@ std::vector<std::string> rpcMethodNames = {
   "fxplayer.addMerge",
   "fxplayer.retryMerge",
   "fxplayer.findMergeByOutput",
+  "fxplayer.readTextOutput",
 #ifdef ENABLE_BITTORRENT
     "aria2.addTorrent",
     "aria2.getPeers",
@@ -132,6 +133,10 @@ std::unique_ptr<RpcMethod> createMethod(const std::string& methodName)
 
   if (methodName == FxplayerFindMergeByOutputRpcMethod::getMethodName()) {
     return make_unique<FxplayerFindMergeByOutputRpcMethod>();
+  }
+
+  if (methodName == FxplayerReadTextOutputRpcMethod::getMethodName()) {
+    return make_unique<FxplayerReadTextOutputRpcMethod>();
   }
 
 #ifdef ENABLE_BITTORRENT

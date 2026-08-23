@@ -43,12 +43,14 @@
 #include <map>
 #include <set>
 #include <memory>
+#include <chrono>
 
 #include "DownloadResult.h"
 #include "TransferStat.h"
 #include "RequestGroup.h"
 #include "NetStat.h"
 #include "IndexedList.h"
+#include "TimerA2.h"
 
 namespace aria2 {
 
@@ -91,6 +93,89 @@ private:
   // currently active downloads, keyed by the domain of each RequestGroup's
   // first URI. Only domains with at least one active download are present.
   std::map<std::string, int> activeConnectionsByDomain_;
+
+  // FXPlayer extension: per-domain override of maxConcurrentDownloadsPerDomain_, set via
+  // fxplayer.addMerge's "domainConnectionCaps" option (see RpcMethodImpl.cc's
+  // FxplayerAddMergeRpcMethod::process and setDomainConnectionCapOverride below). Motivation: an
+  // XNXX account suspension made the global per-domain cap (one value for every domain, whatever
+  // service it belongs to) too coarse — the app wants XNXX's CDN specifically clamped much
+  // tighter (e.g. 1, fully sequential) than the shared default used for other services, without
+  // lowering that shared default for everyone. A domain present here takes priority over
+  // maxConcurrentDownloadsPerDomain_ in fillRequestGroupFromReserver's admission check; a domain
+  // absent here (the common case) uses the global default unchanged. Entries persist for the
+  // daemon's lifetime once set (there's no "unset" — a domain that stops being downloaded just
+  // sits unused in the map), same lifetime as maxConcurrentDownloadsPerDomain_ itself.
+  std::map<std::string, int> domainConnectionCapOverrides_;
+
+  // FXPlayer extension: per-domain minimum interval between successive connection admissions, set
+  // via fxplayer.addMerge's "domainMinAdmissionIntervalMs" option (see RpcMethodImpl.cc's
+  // FxplayerAddMergeRpcMethod::process and setDomainMinAdmissionIntervalOverride below).
+  // Motivation: domainConnectionCapOverrides_ above makes XNXX segment fetches fully sequential,
+  // but sequential alone doesn't stop them being requested flat-out, back to back -- a live
+  // XNXX account-suspension investigation (2026-09-23) found sustained streaks of 500+ segment
+  // requests at sub-1.2s intervals, a shape no real HLS player produces regardless of connection
+  // speed. This is a time-based sibling to the capacity-based cap above: unlike that cap, an
+  // interval floor has no natural mechanism to re-trigger admission once it's cleared (a
+  // capacity slot frees itself and its own completion path calls requestQueueCheck(); a clock
+  // just ticks with nothing watching it), so FillRequestGroupCommand also gained a dedicated poll
+  // gated on hasActiveDomainMinAdmissionIntervalOverrides() below -- see its own comment. Same
+  // lifetime/semantics as domainConnectionCapOverrides_: persists for the daemon's lifetime once
+  // set, 0 (or absent) means no floor.
+  std::map<std::string, std::chrono::milliseconds> domainMinAdmissionIntervalOverrides_;
+
+  // Wall-clock time of the most recent connection admission for each domain with an active
+  // entry in domainMinAdmissionIntervalOverrides_ above. Absent until the first admission.
+  std::map<std::string, Timer> domainLastAdmissionAt_;
+
+  // FXPlayer extension: per-domain rolling admission-volume budget, set via fxplayer.addMerge's
+  // "domainVolumeBudget" option. Motivation: pacing (above) stops segments being requested
+  // flat-out, but two real XNXX account suspensions both landed at almost the same CUMULATIVE
+  // segment count (~1,300) regardless of how long that took to reach (24 min vs 58 min) --
+  // pointing at a fair-use/volume quota on top of (not instead of) the rate limit pacing already
+  // addresses. `count` is the max admissions allowed inside the trailing `window`; `window` uses
+  // wall-clock (system_clock), NOT Timer/steady_clock, specifically so the budget survives a
+  // daemon restart correctly (steady_clock's epoch is only meaningful within one process
+  // lifetime -- see loadDomainVolumeBudgetState's own comment). `count` <= 0 removes the override.
+  struct VolumeBudget {
+    int count = 0;
+    std::chrono::seconds window{0};
+  };
+  std::map<std::string, VolumeBudget> domainVolumeBudgetOverrides_;
+
+  // Wall-clock (system_clock) timestamps of every admission counted against a domain's volume
+  // budget, oldest first. Entries older than that domain's current window are purged lazily on
+  // each check. Loaded from disk once per domain (see loadedVolumeBudgetDomains_) the first time
+  // an override is set for it, so a daemon restart doesn't silently reset the window.
+  std::map<std::string, std::deque<std::chrono::system_clock::time_point>>
+      domainVolumeBudgetLog_;
+
+  // Domains whose persisted volume-budget log has already been loaded from disk this process
+  // lifetime -- loadDomainVolumeBudgetState() is a no-op after the first call per domain, so a
+  // later setDomainVolumeBudgetOverride() call for the same domain (e.g. a second job in the same
+  // session) doesn't re-read stale on-disk state over newer in-memory entries.
+  std::set<std::string> loadedVolumeBudgetDomains_;
+
+  // FXPlayer extension: per-domain random pause inserted specifically at a VIDEO boundary (the
+  // first admission whose parent RequestGroup differs from the previous admission's), set via
+  // fxplayer.addMerge's "domainVideoGapMs" option -- distinct from domainMinAdmissionIntervalOverrides_,
+  // which paces every segment uniformly regardless of which video it belongs to. Real playback has
+  // a human pause between videos, not a metronome; `maxMs` <= 0 removes the override.
+  struct VideoGap {
+    int minMs = 0;
+    int maxMs = 0;
+  };
+  std::map<std::string, VideoGap> domainVideoGapOverrides_;
+
+  // Per-domain video-boundary-gap state: which parent this domain's last-admitted group belonged
+  // to (to detect the NEXT boundary), and — once a boundary is being waited out — the single
+  // randomly-chosen deadline for it, generated once per boundary (not re-rolled every recheck)
+  // so the wait doesn't drift shorter, and cleared once satisfied.
+  struct VideoGapState {
+    a2_gid_t lastParent = 0;
+    bool gapPending = false;
+    Timer deadline;
+  };
+  std::map<std::string, VideoGapState> domainVideoGapState_;
 
   // Domains for which we have already logged a per-domain throttle
   // notice since they last dropped below the limit. Used to emit at
@@ -167,6 +252,25 @@ private:
 
   int optimizeConcurrentDownloads();
 
+  // FXPlayer extension: path of the small text file domainVolumeBudgetLog_ persists to, derived
+  // from the daemon's own --save-session path (same directory, sibling file) so it needs no new
+  // daemon option -- empty if --save-session isn't configured, in which case the budget still
+  // works for the daemon's uptime, it just resets on restart (logged once, not fatal).
+  std::string volumeBudgetStatePath() const;
+
+  // Reads any persisted entries for `domain` from volumeBudgetStatePath() into
+  // domainVolumeBudgetLog_[domain], skipping entries already older than the window passed in (no
+  // point loading what would be purged immediately). No-op if already loaded this process
+  // lifetime (loadedVolumeBudgetDomains_) or if there's nothing on disk for `domain`.
+  void loadDomainVolumeBudgetState(const std::string& domain, std::chrono::seconds window);
+
+  // Rewrites volumeBudgetStatePath() from the current in-memory domainVolumeBudgetLog_ for every
+  // domain that has one. Called after every admission that consumes budget -- cheap (the log per
+  // domain is capped at its own `count`, at most a few hundred timestamps) and guarantees the
+  // file is never more than one admission stale, so a SIGKILL between writes loses at most one
+  // entry rather than the whole session's worth.
+  void persistDomainVolumeBudgetState() const;
+
 public:
   // Returns the lower-cased host of group's first URI (spent or
   // remaining), or an empty string if group has no URI at all.
@@ -180,6 +284,61 @@ public:
   // budget, in which case a later call here (e.g. on completion, to know
   // how much to give back) returns that same clamped figure.
   static int getRequestGroupConnectionWeight(const RequestGroup* group);
+
+  // FXPlayer extension: set (or update) a per-domain override for the connection cap normally
+  // governed globally by maxConcurrentDownloadsPerDomain_ — see domainConnectionCapOverrides_'s
+  // own doc comment. `cap` <= 0 removes any existing override for `domain` (reverting it to the
+  // global default), matching how `max-concurrent-downloads-per-domain=0` means "unlimited" for
+  // the global setting.
+  void setDomainConnectionCapOverride(const std::string& domain, int cap);
+
+  // Effective per-domain connection cap fillRequestGroupFromReserver should use for `domain`:
+  // the override if one is set, else maxConcurrentDownloadsPerDomain_ (which itself may be 0,
+  // meaning unlimited).
+  int effectiveDomainConnectionCap(const std::string& domain) const;
+
+  // FXPlayer extension: maps a request's host to the key its connection cap / pacing budget is
+  // tracked under. An override key containing '*' is a glob pattern (e.g. "hls*.xnxx-cdn.com") that
+  // makes every matching host SHARE one budget -- needed because a site's CDN can serve different
+  // videos from different hostnames, and a per-hostname cap would let those download in parallel
+  // (and each with its own pacing clock). A host matching no pattern maps to itself.
+  std::string resolveDomainBudgetKey(const std::string& domain) const;
+
+  // FXPlayer extension: set (or update) a per-domain minimum interval between successive
+  // connection admissions -- see domainMinAdmissionIntervalOverrides_'s own doc comment.
+  // `interval` <= 0 removes any existing override for `domain` (reverting to no floor).
+  void setDomainMinAdmissionIntervalOverride(const std::string& domain,
+                                              std::chrono::milliseconds interval);
+
+  // Effective minimum admission interval fillRequestGroupFromReserver should use for `domain`:
+  // the override if one is set (and positive), else std::chrono::milliseconds(0) (no floor).
+  std::chrono::milliseconds
+  effectiveDomainMinAdmissionInterval(const std::string& domain) const;
+
+  // True if any domain currently has a positive minimum admission interval override -- gates
+  // FillRequestGroupCommand's dedicated pacing-recheck poll so it costs nothing for any
+  // daemon/job that never uses this feature.
+  bool hasActiveDomainMinAdmissionIntervalOverrides() const;
+
+  // FXPlayer extension: set (or update) a per-domain rolling volume budget -- see
+  // domainVolumeBudgetOverrides_'s own doc comment. `count` <= 0 removes the override. Lazily
+  // loads any persisted admission log for `domain` from disk the first time it's called for that
+  // domain this process lifetime.
+  void setDomainVolumeBudgetOverride(const std::string& domain, int count,
+                                      std::chrono::seconds window);
+
+  // True if any domain currently has an active volume budget override -- gates
+  // FillRequestGroupCommand's recheck poll, same reasoning as the pacing gate above (a volume
+  // budget's release event -- an old entry aging out of the window -- is also purely time-based).
+  bool hasActiveDomainVolumeBudgetOverrides() const;
+
+  // FXPlayer extension: set (or update) a per-domain random pause at video boundaries -- see
+  // domainVideoGapOverrides_'s own doc comment. `maxMs` <= 0 removes the override.
+  void setDomainVideoGapOverride(const std::string& domain, int minMs, int maxMs);
+
+  // True if any domain currently has an active video-gap override -- same recheck-poll gating
+  // reasoning as the other two time-based overrides above.
+  bool hasActiveDomainVideoGapOverrides() const;
 
   RequestGroupMan(std::vector<std::shared_ptr<RequestGroup>> requestGroups,
                   int maxConcurrentDownloads, const Option* option);
