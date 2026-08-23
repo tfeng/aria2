@@ -38,6 +38,7 @@
 #include "common.h"
 
 #include <cassert>
+#include <map>
 #include <string>
 #include <vector>
 #include <memory>
@@ -69,6 +70,25 @@ private:
   std::unique_ptr<AuthConfig> authConfig_;
 
   CookieStorage* cookieStorage_;
+
+  // FXPlayer extension: app-supplied domain -> cookie map (fxplayer.addMerge's "cookies" option),
+  // consulted in createRequest() by this request's OWN CURRENT host (getHost() — correctly
+  // reflects a redirect target, not just the originally-submitted URI) in preference to
+  // cookieStorage_. fxCookiesProvided_ tracks whether the option was set AT ALL (vs. left
+  // undefined) — see its own comment at the fxCookiesProvided_ declaration for why that
+  // distinction is load-bearing, not cosmetic.
+  std::map<std::string, std::string> fxCookiesByDomain_;
+
+  // True iff the RPC caller supplied a "cookies" option for this job (even an empty one). When
+  // true, createRequest() treats fxCookiesByDomain_ as authoritative for the Cookie header on
+  // EVERY request this HttpRequest represents: a host with no entry gets no Cookie header sent,
+  // and cookieStorage_ (this daemon's own long-lived, cross-download cookie jar) is never
+  // consulted as a fallback. Without this flag, "the map has no entry for this host" would be
+  // indistinguishable from "the caller never used this feature," and the daemon's own
+  // accumulated jar would silently fill the gap — exactly the two-cookie-jar inconsistency this
+  // whole mechanism exists to close. False (the default) preserves the pre-existing
+  // cookieStorage_-only behavior untouched for every caller that doesn't set "cookies".
+  bool fxCookiesProvided_;
 
   AuthConfigFactory* authConfigFactory_;
 
@@ -180,6 +200,12 @@ public:
   void setCookieStorage(CookieStorage* cookieStorage);
 
   CookieStorage* getCookieStorage() const;
+
+  // FXPlayer extension: see fxCookiesByDomain_'s own doc comment. `cookiesByDomain` becoming the
+  // authority (fxCookiesProvided_ = true) happens unconditionally here, including when it's
+  // empty — this setter IS the "the caller used this feature" signal, distinct from never
+  // calling it at all.
+  void setFxCookiesByDomain(std::map<std::string, std::string> cookiesByDomain);
 
   void setAuthConfigFactory(AuthConfigFactory* factory);
   void setOption(const Option* option);

@@ -365,6 +365,19 @@ extern PrefPtr PREF_ENABLE_HTTP_PIPELINING;
 extern PrefPtr PREF_MAX_HTTP_PIPELINING;
 // value: string
 extern PrefPtr PREF_HEADER;
+// FXPlayer extension: per-domain cookie map for fxplayer.addMerge, so the app can supply a
+// DIFFERENT cookie per request host (e.g. the site's own page domain AND its CDN's domain
+// together) instead of one flat Cookie header applied to every request in the job regardless of
+// which host it actually targets. Serialized as "domain\tcookieValue" lines joined by "\n" (see
+// getFxCookiesFieldAsOptionValue in RpcMethodImpl.cc for the JSON->this encoding, and
+// HttpRequestCommand.cc for the decode). Deliberately a SEPARATE option from PREF_HEADER (not
+// folded into it) so "this option is defined at all" (even with zero domains) can mean "the app
+// is the sole cookie authority for this job" distinctly from "the app didn't send any Cookie
+// header" — see HttpRequest::createRequest's own comment on fxCookiesByDomain_ for why that
+// distinction matters (it's what stops this daemon's own accumulated cookie jar from silently
+// filling in for a domain the app deliberately didn't list).
+// value: string
+extern PrefPtr PREF_FX_COOKIES;
 // value: string that your file system recognizes as a file name.
 extern PrefPtr PREF_CERTIFICATE;
 // value: string that your file system recognizes as a file name.

@@ -53,6 +53,9 @@
 #include <mutex>
 #include <atomic>
 #include <memory>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
 #include "Logger.h"
 #include "LogFactory.h"
@@ -217,6 +220,27 @@ struct FxMergeJob {
 // hence recursive_mutex rather than plain mutex — re-auditing every call graph edge for double-locking
 // was a needless source of risk when this bought the same safety for free.
 std::recursive_mutex fxMergeMutex;
+
+// Guards the single "ffmpeg remux slot": at most one finalize (fxFinalizeMerge, which forks ffmpeg and does
+// the concat/remux I/O) runs at a time across the whole process, whether triggered by the automatic
+// fxFinalizeMergeAsync path or the synchronous fxplayer.retryMerge RPC. Before this, three HLS downloads
+// finishing around the same moment forked three concurrent ffmpeg processes on the daemon; on a resource-
+// constrained box (e.g. a Raspberry Pi) that CPU/disk contention was enough to starve the RPC-handling
+// thread for tens of seconds at a time, which the FXPlayer client observed as a burst of RPC polling
+// timeouts right at each remux's start (root-caused 2026-08-23 by lining up FXPlayer's app.log against this
+// daemon's own aria2.log). Every caller of fxFinalizeMerge takes this lock immediately around that call
+// (never around anything else) and always releases it before touching fxMergeMutex again, so the two mutexes
+// are never held nested in the same order twice -- fxMergeMutex may be held while acquiring this one
+// (FxplayerRetryMergeRpcMethod::process does exactly that), but this one must never be held while acquiring
+// fxMergeMutex, or the two could deadlock against each other.
+//
+// A job waiting for this slot needs no special app-facing status: fxFinalizeMergeAsync already flips
+// job.state to FX_MERGE_MERGING (and FxplayerRetryMergeRpcMethod::process's own job.state assignment does
+// the same) before the wait begins, so the app's existing "merge phase never counts as a stall" polling
+// logic (WebService.swift's pollAria2UntilTerminal, isMergePhase) already treats slot-wait time exactly like
+// ffmpeg-running time -- no new RPC field needed, unlike the admission-queue `waiting` counter above, which
+// needed one because that wait happened in FX_MERGE_DOWNLOADING state.
+std::mutex fxMergeSlotMutex;
 
 std::map<a2_gid_t, FxMergeJob> fxMergeJobs;
 std::map<a2_gid_t, a2_gid_t> fxMergeChildToParent;
@@ -389,6 +413,82 @@ std::string getHeadersFieldAsOptionValue(const Dict* dict, const char* key)
     joined += line;
   }
   return joined;
+}
+
+// FXPlayer extension: encodes mergeOptions["cookies"] — a JSON object mapping domain -> cookie
+// string, e.g. {"xnxx.com": "sessid=abc; csrf=xyz", "cdn77.xnxx-cdn.com": "cf_clearance=..."} —
+// into PREF_FX_COOKIES's "domain\tcookieValue" (one per line, joined by "\n") on-the-wire format.
+// Returns {present=false} when the "cookies" key is absent entirely (old caller / no cookies to
+// manage), so FxplayerAddMergeRpcMethod::process can leave PREF_FX_COOKIES undefined and preserve
+// the pre-existing cookieStorage_ fallback behavior for anyone who doesn't use this — see
+// HttpRequest::createRequest's own comment for why "option not set at all" must stay
+// distinguishable from "option set to an empty map" (the latter means the app IS the cookie
+// authority for this job, just has nothing for any domain seen so far).
+struct FxCookiesField {
+  bool present = false;
+  std::string encoded;
+};
+
+FxCookiesField getFxCookiesFieldAsOptionValue(const Dict* dict, const char* key)
+{
+  FxCookiesField result;
+  if (!dict) {
+    return result;
+  }
+  const auto* cookiesDict = downcast<Dict>(dict->get(key));
+  if (!cookiesDict) {
+    return result;
+  }
+  result.present = true;
+  std::string encoded;
+  for (const auto& elem : *cookiesDict) {
+    const auto* value = downcast<String>(elem.second.get());
+    if (!value) {
+      continue;
+    }
+    // Domain and cookie value both come from the app's own HTTPCookieStorage-derived data, never
+    // user-typed free text, so a bare tab/newline appearing in either is not expected — still,
+    // skip (rather than corrupt the line-based encoding) if one ever does.
+    if (elem.first.find('\t') != std::string::npos ||
+        elem.first.find('\n') != std::string::npos ||
+        value->s().find('\t') != std::string::npos ||
+        value->s().find('\n') != std::string::npos) {
+      continue;
+    }
+    if (!encoded.empty()) {
+      encoded += "\n";
+    }
+    encoded += elem.first;
+    encoded += "\t";
+    encoded += value->s();
+  }
+  result.encoded = std::move(encoded);
+  return result;
+}
+
+// FXPlayer extension: decodes mergeOptions["domainConnectionCaps"] — a JSON object mapping
+// domain -> integer connection cap, e.g. {"hls-gold-cdn77.xnxx-cdn.com": 1} — for
+// RequestGroupMan::setDomainConnectionCapOverride. Unlike cookies, an absent or empty
+// "domainConnectionCaps" is a pure no-op (no distinction needed between "not present" and
+// "present but empty" — an override is a positive per-domain assertion, not an authority claim
+// over a whole option class, so there's nothing to suppress by its mere presence).
+std::vector<std::pair<std::string, int>>
+getFxDomainConnectionCaps(const Dict* dict, const char* key)
+{
+  std::vector<std::pair<std::string, int>> result;
+  if (!dict) {
+    return result;
+  }
+  const auto* capsDict = downcast<Dict>(dict->get(key));
+  if (!capsDict) {
+    return result;
+  }
+  for (const auto& elem : *capsDict) {
+    if (const auto* value = downcast<Integer>(elem.second.get())) {
+      result.emplace_back(elem.first, static_cast<int>(value->i()));
+    }
+  }
+  return result;
 }
 
 bool getBoolField(const Dict* dict, const char* key, bool defval)
@@ -793,6 +893,23 @@ bool fxRemuxSegments(FxMergeJob& job, const std::string& partPath,
   if (cpid == 0) {
     close(errPipe[0]);
     dup2(errPipe[1], STDERR_FILENO);
+#ifdef __linux__
+    // If aria2 itself dies (crash, kill -9, power loss) while this child is remuxing, don't leave it
+    // running as an orphan indefinitely: ask the kernel to SIGKILL it the moment its parent thread
+    // exits. Nothing will ever rename its output (that logic died with the parent), and a lingering
+    // ffmpeg would keep burning exactly the CPU/disk this whole change is trying to stop contending
+    // for. This doesn't risk a corrupt final file either way -- partPath is a scratch file inside
+    // job.tmpDir, published to job.outputPath only via an atomic rename after ffmpeg exits
+    // successfully (see fxFinalizeMerge), and the next retry through this same tmpDir truncates/
+    // overwrites partPath before starting fresh (fxFinalizeMerge's own `File(partPath).remove()`) --
+    // this is purely about not wasting resources post-crash, not about data safety.
+    prctl(PR_SET_PDEATHSIG, SIGKILL);
+    if (getppid() == 1) {
+      // Parent already gone by the time we installed the signal (a race on an already-dying parent) --
+      // PDEATHSIG won't fire retroactively, so self-terminate now instead of remuxing for no one.
+      _exit(127);
+    }
+#endif
     const char* ffmpegBins[] = {"ffmpeg", "/usr/local/bin/ffmpeg",
                                 "/usr/bin/ffmpeg", nullptr};
     const auto lowerOutput = util::toLower(job.outputPath);
@@ -1382,6 +1499,12 @@ std::unique_ptr<ValueBase> FxplayerAddMergeRpcMethod::process(
   modeForLog = mode;
   const auto headersOptionValue =
       getHeadersFieldAsOptionValue(mergeOptsParam, "headers");
+  const auto fxCookiesField = getFxCookiesFieldAsOptionValue(mergeOptsParam, "cookies");
+  const auto fxDomainConnectionCaps =
+      getFxDomainConnectionCaps(mergeOptsParam, "domainConnectionCaps");
+  for (const auto& entry : fxDomainConnectionCaps) {
+    e->getRequestGroupMan()->setDomainConnectionCapOverride(entry.first, entry.second);
+  }
 
   // Do NOT touch tmpDir synchronously here. On SMB targets this can block JSON-RPC for
   // tens of seconds while a spun-down drive wakes up, causing client-side submit timeouts.
@@ -1417,6 +1540,12 @@ std::unique_ptr<ValueBase> FxplayerAddMergeRpcMethod::process(
     requestOption->put(PREF_CONTINUE, "true");
     if (!headersOptionValue.empty()) {
       requestOption->put(PREF_HEADER, headersOptionValue);
+    }
+    // put() even when fxCookiesField.encoded is empty (zero domains have a cookie) — `present`
+    // alone must make the option `defined()`, since that's the signal that the app is the sole
+    // cookie authority for this job (see PREF_FX_COOKIES's own doc comment).
+    if (fxCookiesField.present) {
+      requestOption->put(PREF_FX_COOKIES, fxCookiesField.encoded);
     }
 
     std::vector<std::shared_ptr<RequestGroup>> created;
@@ -1527,7 +1656,17 @@ std::unique_ptr<ValueBase> FxplayerRetryMergeRpcMethod::process(
   job.errorCode = 0;
   job.errorMessage.clear();
   job.state = FX_MERGE_MERGING;
-  if (!fxFinalizeMerge(job)) {
+  bool finalizeOk;
+  {
+    // Same single remux slot as the automatic path (fxMergeSlotMutex's comment) -- if an automatic
+    // merge for some OTHER download is mid-ffmpeg right now, this call waits for it rather than
+    // forking a second concurrent ffmpeg. This call is already documented to block the whole daemon
+    // for its own remux duration (rare, explicit user action); waiting for someone else's remux to
+    // finish first extends that same accepted tradeoff, it doesn't introduce a new one.
+    std::lock_guard<std::mutex> slotLock(fxMergeSlotMutex);
+    finalizeOk = fxFinalizeMerge(job);
+  }
+  if (!finalizeOk) {
     if (job.cleanupPending && fxAllChildrenDone(job)) {
       fxCleanupFailureArtifacts(job);
     }
@@ -1634,7 +1773,17 @@ void fxFinalizeMergeAsync(a2_gid_t parentGid)
   }
 
   std::thread([parentGid, snapshot]() mutable {
-    const bool ok = fxFinalizeMerge(snapshot);
+    bool ok;
+    {
+      // Queue up for the single remux slot -- see fxMergeSlotMutex's own comment. Multiple finalize
+      // threads spawned close together (the common case: several HLS downloads finishing around the
+      // same time) block here in roughly arrival order and run their ffmpeg one at a time; the job
+      // was already marked FX_MERGE_MERGING before this thread was spawned, so from the app's point
+      // of view nothing distinguishes "waiting for the slot" from "ffmpeg is running" -- both are
+      // legitimate non-stall merge-phase time.
+      std::lock_guard<std::mutex> slotLock(fxMergeSlotMutex);
+      ok = fxFinalizeMerge(snapshot);
+    }
 
     std::lock_guard<std::recursive_mutex> lock(fxMergeMutex);
     auto itr = fxMergeJobs.find(parentGid);
@@ -2596,6 +2745,18 @@ void gatherFxMergeStatus(Dict* entryDict, const FxMergeJob& job,
   size_t completed = 0;
   size_t failed = 0;
   size_t active = 0;
+  // Of the not-yet-done children, how many are still sitting in aria2's own admission queue (most
+  // commonly deferred behind --max-concurrent-downloads-per-domain, RequestGroupMan.cc's per-domain
+  // connection cap) rather than genuinely connected and transferring. This top-level `status` field
+  // (below) can never distinguish the two on its own — it collapses every non-terminal FxMergeJob state
+  // to VLB_ACTIVE regardless of what the underlying child is actually doing — so the app-side stall
+  // watchdog (WebService.swift's pollAria2UntilTerminal, which reads exactly this "waiting" count) has
+  // no way to tell "queued, waiting its turn" apart from "connected but stuck" without it. Root-caused
+  // 2026-08-23: three downloads were force-removed by the app as stalled at 0 bytes while genuinely just
+  // queued behind this cap; the app's first fix attempt checked a plain top-level `status == "waiting"`
+  // that this RPC method can never actually produce, since it's synthesized from FxMergeJob state, not
+  // passed through from the child RequestGroup's real aria2 state — this counter is what that fix needed.
+  size_t waiting = 0;
   std::vector<int64_t> segmentSizeSamples;
   int64_t firstSegmentSample = 0;
 
@@ -2648,6 +2809,12 @@ void gatherFxMergeStatus(Dict* entryDict, const FxMergeJob& job,
     }
     else {
       ++active;
+      // `group` (found above, before this branch) is the same RequestGroup either way — STATE_WAITING
+      // means it's sitting in RequestGroupMan's reserved-groups queue, not yet admitted (see this
+      // function's own `waiting` doc comment above for why the app needs this distinction).
+      if (group && group->getState() == RequestGroup::STATE_WAITING) {
+        ++waiting;
+      }
       if (observedProgress > 0) {
         activeBytes += observedProgress;
       }
@@ -2772,6 +2939,7 @@ void gatherFxMergeStatus(Dict* entryDict, const FxMergeJob& job,
     merge->put("total", util::uitos(job.childGids.size()));
     merge->put("completed", util::uitos(completed));
     merge->put("failed", util::uitos(failed));
+    merge->put("waiting", util::uitos(waiting));
     merge->put("output", job.outputPath);
     merge->put("mode", job.mode);
     merge->put("mergeProgress", fmt("%.3f", job.mergeProgress));
