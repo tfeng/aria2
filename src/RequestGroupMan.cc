@@ -517,6 +517,16 @@ createInitialCommand(const std::shared_ptr<RequestGroup>& requestGroup,
 }
 } // namespace
 
+namespace {
+// FXPlayer extension (2026-09-10): same host match as HttpRequest.cc's identically-named helper — see
+// its own doc comment for why a substring match. Kept as a separate file-local copy rather than a
+// shared header change since it's a one-line check.
+bool isXnxxDiagHost(const std::string& host)
+{
+  return util::toLower(host).find("xnxx") != std::string::npos;
+}
+} // namespace
+
 void RequestGroupMan::fillRequestGroupFromReserver(DownloadEngine* e)
 {
   removeStoppedGroup(e);
@@ -557,51 +567,74 @@ void RequestGroupMan::fillRequestGroupFromReserver(DownloadEngine* e)
     }
     std::string domain;
     int connectionWeight = 1;
-    if (maxConcurrentDownloadsPerDomain_ > 0) {
-      domain = getRequestGroupDomain(groupToAdd.get());
-      if (!domain.empty()) {
-        auto dit = activeConnectionsByDomain_.find(domain);
-        int used = dit == activeConnectionsByDomain_.end() ? 0 : dit->second;
-        if (used >= maxConcurrentDownloadsPerDomain_) {
-          if (loggedThrottledDomains_.insert(domain).second) {
-            A2_LOG_WARN(fmt("Throttling started for domain=%s: "
-                            "%d connections active >= max-concurrent-downloads-per-domain=%d",
-                            domain.c_str(), used,
-                            maxConcurrentDownloadsPerDomain_));
-          }
-          pending.push_back(groupToAdd);
-          continue;
+    // FXPlayer extension: compute the domain unconditionally (cheap -- just reads the group's
+    // first URI) so a per-domain override (domainConnectionCapOverrides_, e.g. XNXX's CDN
+    // clamped to 1) still applies even when maxConcurrentDownloadsPerDomain_ itself is 0
+    // (unlimited) -- an override should never depend on the global default being enabled.
+    domain = getRequestGroupDomain(groupToAdd.get());
+    int effectiveCap = domain.empty() ? 0 : effectiveDomainConnectionCap(domain);
+    if (effectiveCap > 0) {
+      auto dit = activeConnectionsByDomain_.find(domain);
+      int used = dit == activeConnectionsByDomain_.end() ? 0 : dit->second;
+      if (used >= effectiveCap) {
+        if (loggedThrottledDomains_.insert(domain).second) {
+          A2_LOG_WARN(fmt("Throttling started for domain=%s: "
+                          "%d connections active >= effective-per-domain-cap=%d",
+                          domain.c_str(), used, effectiveCap));
         }
-        // Admit, but clamp this download's own connection fan-out so it
-        // (plus whatever else is already active for this domain) doesn't
-        // exceed the configured budget. A single fast/small download isn't
-        // worth reserving its full split/max-connection-per-server for --
-        // clamp down to whatever headroom is left, with a floor of 1 so a
-        // download is never starved outright.
-        int desired = getRequestGroupConnectionWeight(groupToAdd.get());
-        int allowed = std::max(1, maxConcurrentDownloadsPerDomain_ - used);
-        connectionWeight = std::min(desired, allowed);
-        if (connectionWeight < desired) {
-          // numConcurrentCommand_ is what createInitialCommand() actually
-          // reads to decide how many connections to open -- it was cached
-          // from PREF_SPLIT in the RequestGroup constructor, so merely
-          // rewriting the Option here (kept below for consistency/anything
-          // else that reads it back, e.g. getRequestGroupConnectionWeight
-          // on completion) would silently have no effect on the real
-          // connection count without also updating this directly.
-          groupToAdd->setNumConcurrentCommand(connectionWeight);
-          const auto& groupOption = groupToAdd->getOption();
-          groupOption->put(PREF_SPLIT, util::itos(connectionWeight));
-          groupOption->put(PREF_MAX_CONNECTION_PER_SERVER,
-                           util::itos(connectionWeight));
-          A2_LOG_WARN(fmt("Capping connections for domain=%s gid=%s: "
-                          "wanted %d, granted %d (domain budget=%d, %d already in use)",
-                          domain.c_str(),
-                          GroupId::toHex(groupToAdd->getGID()).c_str(), desired,
-                          connectionWeight, maxConcurrentDownloadsPerDomain_,
-                          used));
-        }
+        pending.push_back(groupToAdd);
+        continue;
       }
+      // Admit, but clamp this download's own connection fan-out so it
+      // (plus whatever else is already active for this domain) doesn't
+      // exceed the configured budget. A single fast/small download isn't
+      // worth reserving its full split/max-connection-per-server for --
+      // clamp down to whatever headroom is left, with a floor of 1 so a
+      // download is never starved outright.
+      int desired = getRequestGroupConnectionWeight(groupToAdd.get());
+      int allowed = std::max(1, effectiveCap - used);
+      connectionWeight = std::min(desired, allowed);
+      if (connectionWeight < desired) {
+        // numConcurrentCommand_ is what createInitialCommand() actually
+        // reads to decide how many connections to open -- it was cached
+        // from PREF_SPLIT in the RequestGroup constructor, so merely
+        // rewriting the Option here (kept below for consistency/anything
+        // else that reads it back, e.g. getRequestGroupConnectionWeight
+        // on completion) would silently have no effect on the real
+        // connection count without also updating this directly.
+        groupToAdd->setNumConcurrentCommand(connectionWeight);
+        const auto& groupOption = groupToAdd->getOption();
+        groupOption->put(PREF_SPLIT, util::itos(connectionWeight));
+        groupOption->put(PREF_MAX_CONNECTION_PER_SERVER,
+                         util::itos(connectionWeight));
+        A2_LOG_WARN(fmt("Capping connections for domain=%s gid=%s: "
+                        "wanted %d, granted %d (domain budget=%d, %d already in use)",
+                        domain.c_str(),
+                        GroupId::toHex(groupToAdd->getGID()).c_str(), desired,
+                        connectionWeight, effectiveCap,
+                        used));
+      }
+    }
+    else {
+      domain.clear();
+    }
+    // FXPlayer extension (2026-09-10): WARN-level connection-admission diagnostic for XNXX, requested
+    // by the user so a future account block can be diagnosed from ~/.aria2/aria2.log alone. Complements
+    // HttpRequest.cc's per-request header dump (which shows WHAT was sent) with the concurrency-control
+    // side (WHEN/whether this connection was admitted, and against what cap) — fires once per admitted
+    // group, not per throttle-recheck, since a deferred group already `continue`s past this point above
+    // without reaching here.
+    if (!domain.empty() && isXnxxDiagHost(domain)) {
+      // find(), not operator[] — activeConnectionsByDomain_'s own invariant (see its declaration's
+      // comment) is that only domains with at least one ACTIVE download are present at all; operator[]
+      // would silently insert a spurious zero-entry for a domain with none, corrupting that invariant
+      // as a side effect of merely logging.
+      auto dit = activeConnectionsByDomain_.find(domain);
+      int activeBeforeThis = dit == activeConnectionsByDomain_.end() ? 0 : dit->second;
+      A2_LOG_WARN(fmt("[xnxx-diag] connection ADMITTED domain=%s gid=%s effectiveCap=%d "
+                      "activeBeforeThis=%d grantedWeight=%d",
+                      domain.c_str(), GroupId::toHex(groupToAdd->getGID()).c_str(), effectiveCap,
+                      activeBeforeThis, connectionWeight));
     }
     // Drop pieceStorage here because paused download holds its
     // reference.
@@ -1108,6 +1141,34 @@ void RequestGroupMan::initWrDiskCache()
   if (limit > 0) {
     wrDiskCache_ = make_unique<WrDiskCache>(limit);
   }
+}
+
+void RequestGroupMan::setDomainConnectionCapOverride(const std::string& domain,
+                                                      int cap)
+{
+  // Normalize to lower-case here, at the single point every override enters the map, so it
+  // always matches effectiveDomainConnectionCap's lookup key -- which is always
+  // getRequestGroupDomain()'s result, itself lower-cased (see its own util::toLower call). The
+  // RPC caller's domain string (JSON from the app, ultimately a URL host) isn't guaranteed to
+  // already be lower-case, and a mismatch here wouldn't error -- it would just silently miss the
+  // override and fall back to the global default, defeating the whole point of a tighter
+  // per-domain cap (e.g. XNXX's) without any visible symptom.
+  auto normalized = util::toLower(domain);
+  if (cap <= 0) {
+    domainConnectionCapOverrides_.erase(normalized);
+  }
+  else {
+    domainConnectionCapOverrides_[normalized] = cap;
+  }
+}
+
+int RequestGroupMan::effectiveDomainConnectionCap(const std::string& domain) const
+{
+  auto it = domainConnectionCapOverrides_.find(domain);
+  if (it != domainConnectionCapOverrides_.end()) {
+    return it->second;
+  }
+  return maxConcurrentDownloadsPerDomain_;
 }
 
 std::string RequestGroupMan::getRequestGroupDomain(const RequestGroup* group)

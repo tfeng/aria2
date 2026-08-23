@@ -92,6 +92,19 @@ private:
   // first URI. Only domains with at least one active download are present.
   std::map<std::string, int> activeConnectionsByDomain_;
 
+  // FXPlayer extension: per-domain override of maxConcurrentDownloadsPerDomain_, set via
+  // fxplayer.addMerge's "domainConnectionCaps" option (see RpcMethodImpl.cc's
+  // FxplayerAddMergeRpcMethod::process and setDomainConnectionCapOverride below). Motivation: an
+  // XNXX account suspension made the global per-domain cap (one value for every domain, whatever
+  // service it belongs to) too coarse — the app wants XNXX's CDN specifically clamped much
+  // tighter (e.g. 1, fully sequential) than the shared default used for other services, without
+  // lowering that shared default for everyone. A domain present here takes priority over
+  // maxConcurrentDownloadsPerDomain_ in fillRequestGroupFromReserver's admission check; a domain
+  // absent here (the common case) uses the global default unchanged. Entries persist for the
+  // daemon's lifetime once set (there's no "unset" — a domain that stops being downloaded just
+  // sits unused in the map), same lifetime as maxConcurrentDownloadsPerDomain_ itself.
+  std::map<std::string, int> domainConnectionCapOverrides_;
+
   // Domains for which we have already logged a per-domain throttle
   // notice since they last dropped below the limit. Used to emit at
   // most one log line per throttle episode instead of one per
@@ -180,6 +193,18 @@ public:
   // budget, in which case a later call here (e.g. on completion, to know
   // how much to give back) returns that same clamped figure.
   static int getRequestGroupConnectionWeight(const RequestGroup* group);
+
+  // FXPlayer extension: set (or update) a per-domain override for the connection cap normally
+  // governed globally by maxConcurrentDownloadsPerDomain_ — see domainConnectionCapOverrides_'s
+  // own doc comment. `cap` <= 0 removes any existing override for `domain` (reverting it to the
+  // global default), matching how `max-concurrent-downloads-per-domain=0` means "unlimited" for
+  // the global setting.
+  void setDomainConnectionCapOverride(const std::string& domain, int cap);
+
+  // Effective per-domain connection cap fillRequestGroupFromReserver should use for `domain`:
+  // the override if one is set, else maxConcurrentDownloadsPerDomain_ (which itself may be 0,
+  // meaning unlimited).
+  int effectiveDomainConnectionCap(const std::string& domain) const;
 
   RequestGroupMan(std::vector<std::shared_ptr<RequestGroup>> requestGroups,
                   int maxConcurrentDownloads, const Option* option);
