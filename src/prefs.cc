@@ -413,6 +413,10 @@ PrefPtr PREF_ENABLE_HTTP_PIPELINING = makePref("enable-http-pipelining");
 PrefPtr PREF_MAX_HTTP_PIPELINING = makePref("max-http-pipelining");
 // value: string
 PrefPtr PREF_HEADER = makePref("header");
+// value: string (see prefs.h for the encoding)
+PrefPtr PREF_FX_COOKIES = makePref("fx-cookies");
+// value: string (see prefs.h for the encoding)
+PrefPtr PREF_FX_ALLOWED_HOST_SUFFIXES = makePref("fx-allowed-host-suffixes");
 // value: string that your file system recognizes as a file name.
 PrefPtr PREF_CERTIFICATE = makePref("certificate");
 // value: string that your file system recognizes as a file name.

@@ -35,6 +35,7 @@
 #include "HttpRequestCommand.h"
 
 #include <algorithm>
+#include <map>
 
 #include "Request.h"
 #include "DownloadEngine.h"
@@ -94,6 +95,35 @@ createHttpRequest(const std::shared_ptr<Request>& req,
   httpRequest->setFileEntry(fileEntry);
   httpRequest->setSegment(segment);
   httpRequest->addHeader(option->get(PREF_HEADER));
+  // FXPlayer extension: decode PREF_FX_COOKIES's "domain\tcookieValue" lines (see prefs.h's own
+  // comment for the encoding, and RpcMethodImpl.cc's getFxCookiesFieldAsOptionValue for how it's
+  // produced) back into a domain->cookie map and hand it to this request. option->defined(...)
+  // — not just "is the decoded map non-empty" — is what signals "the caller used this feature",
+  // since an RPC caller can legitimately supply an empty map (no cookie known for ANY domain
+  // yet, but still wants sole authority so this daemon's own cookie jar never fills the gap).
+  if (option->defined(PREF_FX_COOKIES)) {
+    std::map<std::string, std::string> fxCookiesByDomain;
+    const auto& encoded = option->get(PREF_FX_COOKIES);
+    size_t lineStart = 0;
+    while (lineStart <= encoded.size()) {
+      auto lineEnd = encoded.find('\n', lineStart);
+      if (lineEnd == std::string::npos) {
+        lineEnd = encoded.size();
+      }
+      if (lineEnd > lineStart) {
+        auto tab = encoded.find('\t', lineStart);
+        if (tab != std::string::npos && tab < lineEnd) {
+          fxCookiesByDomain.emplace(encoded.substr(lineStart, tab - lineStart),
+                                    encoded.substr(tab + 1, lineEnd - tab - 1));
+        }
+      }
+      if (lineEnd == encoded.size()) {
+        break;
+      }
+      lineStart = lineEnd + 1;
+    }
+    httpRequest->setFxCookiesByDomain(std::move(fxCookiesByDomain));
+  }
   httpRequest->setCookieStorage(e->getCookieStorage().get());
   httpRequest->setAuthConfigFactory(e->getAuthConfigFactory().get());
   httpRequest->setOption(option.get());

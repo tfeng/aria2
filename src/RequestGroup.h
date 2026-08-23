@@ -192,6 +192,15 @@ private:
 
   bool seedOnly_;
 
+  // FXPlayer extension: the domain and connection weight this group was COUNTED under in
+  // RequestGroupMan::activeConnectionsByDomain_ at admission time (empty/0 when it was not
+  // counted). Release must subtract exactly this, not a value re-derived from live state: a
+  // later changeUri/changeOption (or a per-domain cap override that appeared after admission)
+  // would otherwise subtract a different weight or hit a different key, leaking or stealing
+  // budget and wedging a cap-1 domain permanently.
+  std::string admittedDomain_;
+  int admittedWeight_ = 0;
+
   void validateFilename(const std::string& expectedFilename,
                         const std::string& actualFilename) const;
 
@@ -271,6 +280,21 @@ public:
   void validateTotalLength(int64_t actualTotalLength) const;
 
   void setNumConcurrentCommand(int num) { numConcurrentCommand_ = num; }
+
+  void setAdmittedConnectionBudget(std::string domain, int weight)
+  {
+    admittedDomain_ = std::move(domain);
+    admittedWeight_ = weight;
+  }
+
+  // Returns the recorded budget and clears it, so a second release can never double-subtract.
+  std::pair<std::string, int> takeAdmittedConnectionBudget()
+  {
+    std::pair<std::string, int> r(std::move(admittedDomain_), admittedWeight_);
+    admittedDomain_.clear();
+    admittedWeight_ = 0;
+    return r;
+  }
 
   int getNumConcurrentCommand() const { return numConcurrentCommand_; }
 

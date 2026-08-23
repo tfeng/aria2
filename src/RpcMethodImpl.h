@@ -163,6 +163,20 @@ public:
   static const char* getMethodName() { return "fxplayer.findMergeByOutput"; }
 };
 
+// FXPlayer extension (item 6, 2026-09-27): reads back a completed merge job's output as text and
+// deletes it -- lets the app fetch a small file (an HLS playlist) through the SAME host/connection
+// its segments come from, by submitting it as an ordinary single-URL fxplayer.addMerge job (concat
+// mode, ephemeral output path) and then calling this instead of leaving the file on disk. See
+// RpcMethodImpl.cc's own comment on the method for the full rationale.
+class FxplayerReadTextOutputRpcMethod : public RpcMethod {
+protected:
+  virtual std::unique_ptr<ValueBase> process(const RpcRequest& req,
+                                             DownloadEngine* e) CXX11_OVERRIDE;
+
+public:
+  static const char* getMethodName() { return "fxplayer.readTextOutput"; }
+};
+
 class RemoveRpcMethod : public RpcMethod {
 protected:
   virtual std::unique_ptr<ValueBase> process(const RpcRequest& req,
