@@ -76,6 +76,27 @@ ARIA2_ARG_DISABLE([epoll])
 ARIA2_ARG_ENABLE([libaria2])
 ARIA2_ARG_ENABLE([werror])
 
+AC_ARG_WITH([boringssl-impersonate],
+  AS_HELP_STRING([--with-boringssl-impersonate[=DIR]],
+                 [Use a vendored curl-impersonate-patched BoringSSL at DIR (containing lib/libssl.a,
+                  lib/libcrypto.a, include/) for HTTPS instead of GnuTLS/system OpenSSL, so aria2's own
+                  TLS ClientHello mimics a real Chrome install (see FXPlayer's Docs/SSL.md). Opt-in;
+                  omitting this flag leaves the default GnuTLS build untouched. DIR is optional: a bare
+                  --with-boringssl-impersonate defaults to deps/boringssl-impersonate, the location
+                  ./fetch-curl-impersonate-deps.sh populates (see Docs/Aria2.md). Optionally pass
+                  --with-brotli-impersonate too (a vendored libbrotlidec-static.a/libbrotlicommon-static.a)
+                  to enable the certificate-compression extension Chrome also sends; without it the
+                  BoringSSL backend still builds, just without that one extension.]),
+  [with_boringssl_impersonate=$withval], [with_boringssl_impersonate=no])
+
+AC_ARG_WITH([brotli-impersonate],
+  AS_HELP_STRING([--with-brotli-impersonate[=DIR]],
+                 [Vendored brotli decoder (lib/libbrotlidec-static.a, lib/libbrotlicommon-static.a,
+                  include/brotli/) for the certificate-compression TLS extension. Only used together with
+                  --with-boringssl-impersonate. DIR is optional, defaulting to deps/brotli-impersonate —
+                  same as --with-boringssl-impersonate above.]),
+  [with_brotli_impersonate=$withval], [with_brotli_impersonate=no])
+
 AC_ARG_WITH([ca-bundle],
   AS_HELP_STRING([--with-ca-bundle=FILE],[Use FILE as default CA bundle.]),
   [AC_DEFINE_UNQUOTED([CA_BUNDLE], ["$withval"], [Define to choose default CA bundle.])
@@ -381,6 +402,72 @@ if test "x$with_wintls" = "xyes"; then
   fi
 fi
 
+have_boringssl_impersonate=no
+if test "x$with_boringssl_impersonate" != "xno" && test "x$have_ssl" != "xyes"; then
+  # Canonicalize to an absolute path: aria2's build compiles from several different subdirectories
+  # (src/, lib/, ...), not just the repo root configure runs from, so a relative --with-boringssl-impersonate
+  # argument baked verbatim into -I/lib flags below would resolve against whichever directory the compiler
+  # happens to be invoked from at build time — silently missing the real headers/libs (falling through to
+  # any system openssl/ssl.h instead) rather than failing loudly. Caught when a relative-path configure
+  # invocation compiled cleanly against the wrong (system) OpenSSL headers, missing every BoringSSL-only
+  # symbol (SSL_CTX_set_permute_extensions et al.) with "not declared in this scope" errors.
+  # A bare --with-boringssl-impersonate (no =DIR) defaults to the conventional location
+  # fetch-curl-impersonate-deps.sh populates, so the documented build recipe (Docs/Aria2.md) can just be
+  # "./fetch-curl-impersonate-deps.sh && ./configure --with-boringssl-impersonate --with-brotli-impersonate"
+  # — no path to remember or keep in sync between the fetch script and this flag. An explicit =DIR still
+  # overrides it for anyone pointing at a different vendored build.
+  boringssl_arg="$with_boringssl_impersonate"
+  test "x$boringssl_arg" = "xyes" && boringssl_arg="$srcdir/deps/boringssl-impersonate"
+  boringssl_dir="$(cd "$boringssl_arg" && pwd)"
+  if test ! -f "$boringssl_dir/lib/libssl.a" || test ! -f "$boringssl_dir/lib/libcrypto.a" \
+     || test ! -d "$boringssl_dir/include"; then
+    AC_MSG_ERROR([--with-boringssl-impersonate=$boringssl_dir does not look like a vendored BoringSSL build (expected lib/libssl.a, lib/libcrypto.a, include/)])
+  fi
+  have_boringssl_impersonate=yes
+  have_openssl=yes
+  have_ssl=yes
+  AC_DEFINE([HAVE_OPENSSL], [1], [Define to 1 if you have openssl.])
+  AC_DEFINE([HAVE_BORINGSSL_IMPERSONATE], [1],
+            [Define to 1 if using the vendored curl-impersonate BoringSSL backend (Chrome TLS fingerprint).])
+  OPENSSL_CFLAGS="-I$boringssl_dir/include"
+  OPENSSL_LIBS="$boringssl_dir/lib/libssl.a $boringssl_dir/lib/libcrypto.a -lpthread"
+
+  if test "x$with_brotli_impersonate" != "xno"; then
+    brotli_arg="$with_brotli_impersonate"
+    test "x$brotli_arg" = "xyes" && brotli_arg="$srcdir/deps/brotli-impersonate"   # same bare-flag default as boringssl_dir above
+    brotli_dir="$(cd "$brotli_arg" && pwd)"
+    if test ! -f "$brotli_dir/lib/libbrotlidec-static.a" || test ! -f "$brotli_dir/lib/libbrotlicommon-static.a" \
+       || test ! -d "$brotli_dir/include/brotli"; then
+      AC_MSG_ERROR([--with-brotli-impersonate=$brotli_dir does not look like a vendored brotli build (expected lib/libbrotlidec-static.a, lib/libbrotlicommon-static.a, include/brotli/)])
+    fi
+    AC_DEFINE([HAVE_BROTLI_IMPERSONATE], [1],
+              [Define to 1 if the vendored brotli decoder is available for the cert-compression TLS extension.])
+    OPENSSL_CFLAGS="$OPENSSL_CFLAGS -I$brotli_dir/include"
+    OPENSSL_LIBS="$OPENSSL_LIBS $brotli_dir/lib/libbrotlidec-static.a $brotli_dir/lib/libbrotlicommon-static.a"
+  fi
+
+  AC_SUBST([OPENSSL_CFLAGS])
+  AC_SUBST([OPENSSL_LIBS])
+
+  # Same AC_CHECK_FUNCS probes the vanilla-OpenSSL branch below runs, so LibsslMessageDigestImpl.cc's
+  # HAVE_EVP_SHA224/256/384/512 feature gates come out correctly instead of silently defaulting to "absent"
+  # (BoringSSL has all of these; skipping this would have quietly disabled those checksum algorithms).
+  save_CPPFLAGS=$CPPFLAGS
+  save_LIBS=$LIBS
+  CPPFLAGS="$OPENSSL_CFLAGS $CPPFLAGS"
+  LIBS="$OPENSSL_LIBS $LIBS"
+  AC_CHECK_FUNCS([EVP_DigestInit_ex], [have_digestinit_ex=yes])
+  if test "x$have_digestinit_ex" = "x"; then
+    AC_DEFINE([HAVE_OLD_OPENSSL], [1], [Define to 1 if you have old openssl.])
+  fi
+  AC_CHECK_FUNCS([EVP_sha224])
+  AC_CHECK_FUNCS([EVP_sha256])
+  AC_CHECK_FUNCS([EVP_sha384])
+  AC_CHECK_FUNCS([EVP_sha512])
+  CPPFLAGS=$save_CPPFLAGS
+  LIBS=$save_LIBS
+fi
+
 have_libgnutls=no
 if test "x$with_gnutls" = "xyes" && test "x$have_ssl" != "xyes"; then
   # gnutls >= 2.8 doesn't have libgnutls-config anymore. We require
@@ -402,7 +489,13 @@ if test "x$with_gnutls" = "xyes" && test "x$have_ssl" != "xyes"; then
   fi
 fi
 
-have_openssl=no
+if test "x$have_boringssl_impersonate" != "xyes"; then
+  # Skip this reset when --with-boringssl-impersonate already set have_openssl=yes above — this
+  # unconditional reset predates that flag and would otherwise silently clobber it, since
+  # AM_CONDITIONAL([HAVE_OPENSSL], ...) below reads whatever have_openssl ends up as, not what it was
+  # when first set.
+  have_openssl=no
+fi
 if test "x$with_openssl" = "xyes" && test "x$have_ssl" != "xyes"; then
   PKG_CHECK_MODULES([OPENSSL], [openssl >= 0.9.8],
                     [have_openssl=yes], [have_openssl=no])

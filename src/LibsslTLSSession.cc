@@ -81,6 +81,14 @@ int OpenSSLTLSSession::init(sock_t sockfd)
   if (rv_ == 0) {
     return TLS_ERR_ERROR;
   }
+#ifdef HAVE_BORINGSSL_IMPERSONATE
+  // curl-impersonate: ALPS extension (17513), matching the http/1.1-only ALPN offered in
+  // LibsslTLSContext.cc — see its comment for why this profile doesn't also offer h2
+  // (curl-8.1.1/lib/vtls/openssl.c:4060-4070).
+  static const char kAlpsHttp11[] = "http/1.1";
+  SSL_add_application_settings(
+      ssl_, reinterpret_cast<const uint8_t*>(kAlpsHttp11), sizeof(kAlpsHttp11) - 1, nullptr, 0);
+#endif // HAVE_BORINGSSL_IMPERSONATE
   return TLS_ERR_OK;
 }
 

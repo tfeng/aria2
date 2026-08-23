@@ -20,6 +20,11 @@ config.sub
 configure
 install-sh
 .deps/
+# curl-impersonate BoringSSL/brotli static libs (Docs/SSL.md Part 1) — built by
+# fetch-curl-impersonate-deps.sh from a pinned upstream revision; not committed.
+/deps/boringssl-impersonate/
+/deps/brotli-impersonate/
+/build/
 stamp-h1
 INSTALL
 *.gmo

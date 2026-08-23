@@ -1,0 +1,116 @@
+FXPlayer build instructions
+****************************
+
+This file documents how to build THIS FORK for FXPlayer's use case: aria2 with curl-impersonate's
+Chrome-116 TLS/HTTP fingerprint (BoringSSL + brotli), plus the fxplayer.* RPC methods (merge/remux,
+per-domain connection limiting) layered on top of upstream aria2. It supplements, not replaces, the
+generic autotools INSTALL file in this directory.
+
+Design background and the full FXPlayer <-> aria2 contract live in the FXPlayer app repo:
+Docs/Aria2.md and Docs/SSL.md. This file is just the practical "how do I build it" recipe.
+
+
+Normal build (fresh checkout)
+==============================
+
+    git clone <this fork's URL> aria2 && cd aria2
+    ./fetch-curl-impersonate-deps.sh
+    autoreconf -fi
+    ./configure --with-boringssl-impersonate --with-brotli-impersonate --without-gnutls
+    make -j$(nproc)
+
+No manual dependency setup and no assumption of any pre-existing local checkout of curl-impersonate
+anywhere on the machine.
+
+fetch-curl-impersonate-deps.sh (repo root) builds the two vendored dependencies
+--with-boringssl-impersonate/--with-brotli-impersonate need: a patched BoringSSL carrying Chrome 116's
+TLS profile, and brotli for its certificate-compression extension. It shallow-clones
+lwthiker/curl-impersonate at a pinned commit into a gitignored scratch dir (build/curl-impersonate-src/)
+-- used READ-ONLY, purely as a source of its own official patches and Makefile targets, never modified --
+and drives that project's own `make` targets for just these two library sets (curl-impersonate's Makefile
+already does the correct native-Linux CMake/autotools build for them; this script doesn't reimplement any
+of it). curl-impersonate's own curl/nghttp2 are deliberately NOT built -- aria2 uses its own HTTP stack
+and only borrows curl-impersonate's TLS backend + brotli decompression (src/LibsslTLSContext.cc,
+src/LibsslTLSSession.cc). Output lands at deps/boringssl-impersonate/{lib,include}/ and
+deps/brotli-impersonate/{lib,include}/ -- gitignored, and exactly the shape configure.ac expects.
+Idempotent (a stamp file keyed on the pinned commit skips rebuilding on a second run); pass --force to
+rebuild anyway.
+
+--with-boringssl-impersonate/--with-brotli-impersonate accept a bare flag (no =DIR) that defaults to
+deps/boringssl-impersonate / deps/brotli-impersonate respectively -- the exact paths the fetch script
+populates -- so the two steps above compose with zero path bookkeeping. Pass an explicit =DIR to point at
+a different vendored build instead. --without-gnutls isn't required by the BoringSSL flags themselves,
+just a preference for a build that's unambiguously all-BoringSSL rather than compiling both TLS backends
+in.
+
+autoreconf -fi regenerates configure/Makefile.in from configure.ac/Makefile.am. Skip it if configure is
+already present and current for your checkout (e.g. a release tarball ships a pre-generated one) --
+running it is always safe either way, just occasionally unnecessary.
+
+
+Rebuilding from scratch (clean slate)
+========================================
+
+To wipe every derived/generated file and rebuild from nothing -- useful after pulling upstream changes,
+bumping the curl-impersonate pin, or just to confirm the build is fully reproducible:
+
+    git status --short              # confirm nothing you care about is uncommitted first
+    git clean -ndx                  # DRY RUN: preview what would be deleted
+    git clean -fdx                  # actually delete it
+    ./fetch-curl-impersonate-deps.sh
+    autoreconf -fi
+    ./configure --with-boringssl-impersonate --with-brotli-impersonate --without-gnutls
+    make -j$(nproc)
+
+git clean only ever removes untracked/ignored files -- it cannot touch anything committed, so your source
+edits are never at risk. The -x flag matters specifically because deps/{boringssl,brotli}-impersonate/
+and build/ are gitignored, and plain git clean -fd skips ignored files by default; without -x those two
+directories (and configure, Makefile, config.log, config.status, src/aria2c, autom4te.cache/, etc.) would
+survive the clean and you wouldn't actually be starting from a pristine tree.
+
+IMPORTANT: git clean deletes untracked files too. If you have local changes you haven't committed yet
+(including a brand-new script you just added, like fetch-curl-impersonate-deps.sh itself the first time
+around), commit or at least `git add` them BEFORE running git clean -fdx, or they will be deleted along
+with everything else.
+
+
+Verifying the build actually works
+=====================================
+
+Version/feature banner (sanity check only -- see the note below about what it does NOT prove):
+
+    ./src/aria2c --version
+
+Confirm the binary is actually linked against the vendored BoringSSL, not falling back to system OpenSSL:
+
+    grep HAVE_BORINGSSL_IMPERSONATE config.h        # should print: #define HAVE_BORINGSSL_IMPERSONATE 1
+    ldd src/aria2c | grep -i 'ssl\|crypto'          # should print NOTHING (statically linked, no libssl.so/libcrypto.so)
+
+Note on --version's own output: it prints something like "Libraries: ... OpenSSL/1.1.1g" even when
+BoringSSL is what's actually linked in. That's not a bug -- BoringSSL deliberately self-reports as
+"OpenSSL 1.1.1" for compatibility with code that checks that exact string. Don't use that line to judge
+whether the BoringSSL build succeeded; use the two checks above instead.
+
+Real functional test -- an actual HTTPS request through the built binary (the acceptance bar that
+actually matters):
+
+    ./src/aria2c --enable-rpc --rpc-listen-port=26800 --rpc-listen-all=false \
+      --dir=/tmp/aria2-smoketest --no-conf --check-certificate=false &
+    curl -s http://127.0.0.1:26800/jsonrpc -d \
+      '{"jsonrpc":"2.0","id":"1","method":"aria2.addUri","params":[["https://www.google.com/generate_204"]]}'
+    # then poll aria2.tellStatus for that gid's "status"/"errorMessage"
+
+A successful TLS handshake shows up as the request actually reaching the server -- for this specific URL,
+that's an "Unexpected status 204" error (Google's connectivity-check endpoint deliberately returns no
+content, which aria2 correctly treats as nothing to download) -- NOT a TLS/connection-level error. Any
+genuine certificate/handshake/connection failure would show a distinctly different error message.
+
+
+Keeping in sync with FXPlayer (the iOS app)
+==============================================
+
+FXPlayer's own iOS build (Scripts/build-curl-impersonate.sh in the FXPlayer app repo) fetches
+curl-impersonate the same way, at the SAME pinned commit as fetch-curl-impersonate-deps.sh in this repo --
+the two must always agree, since the app and this daemon both claim to be the same browser and a mismatch
+would itself be a detectable inconsistency. See Docs/SSL.md's "bumping the pinned curl-impersonate
+revision" section (in the FXPlayer app repo) before changing the pinned commit in either place.

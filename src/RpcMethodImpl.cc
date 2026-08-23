@@ -49,6 +49,10 @@
 #include <errno.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <memory>
 
 #include "Logger.h"
 #include "LogFactory.h"
@@ -188,9 +192,31 @@ struct FxMergeJob {
   double mergeProgress = 0.0;
   bool cleanupPending = false;
   bool cleanupDone = false;
-  bool cancelRequested = false;
+  // Backed by a shared atomic (not a plain bool) so a cancel request set on the LIVE map entry (main
+  // thread, under fxMergeMutex) is visible to a finalize worker thread that took a VALUE COPY of this
+  // job earlier — see fxFinalizeMergeAsync below. A plain bool copy would freeze cancellation at
+  // snapshot time; every FxMergeJob copy make from this point on shares the same underlying atomic via
+  // the shared_ptr, so the copy and the original always agree.
+  std::shared_ptr<std::atomic<bool>> cancelFlag =
+      std::make_shared<std::atomic<bool>>(false);
+  bool cancelRequested() const
+  {
+    return cancelFlag->load(std::memory_order_relaxed);
+  }
+  void requestCancel() { cancelFlag->store(true, std::memory_order_relaxed); }
   std::time_t terminalEpochSec = 0;
 };
+
+// Guards fxMergeJobs/fxMergeChildToParent/fxMergeOutputOwner. Every access to these three maps used to
+// be safe by construction: aria2's RPC handlers and its group-stopped callback all run on the single
+// main event-loop thread, so there was never any concurrent access to guard against. That stopped being
+// true once fxFinalizeMergeAsync (below) started running the ffmpeg remux/concat/publish sequence on a
+// background std::thread instead of blocking the main thread for it — see that function's comment for
+// why. Every one of the ~10 functions that touch these maps now takes this lock, including ones that
+// call each other while already holding it (fxPruneExpiredMergeJobs -> fxEraseMergeJob, for instance),
+// hence recursive_mutex rather than plain mutex — re-auditing every call graph edge for double-locking
+// was a needless source of risk when this bought the same safety for free.
+std::recursive_mutex fxMergeMutex;
 
 std::map<a2_gid_t, FxMergeJob> fxMergeJobs;
 std::map<a2_gid_t, a2_gid_t> fxMergeChildToParent;
@@ -251,6 +277,7 @@ void fxSetTerminalNow(FxMergeJob& job)
 
 void fxEraseMergeJob(a2_gid_t parentGid)
 {
+  std::lock_guard<std::recursive_mutex> lock(fxMergeMutex);
   auto it = fxMergeJobs.find(parentGid);
   if (it == fxMergeJobs.end()) {
     return;
@@ -271,6 +298,7 @@ void fxEraseMergeJob(a2_gid_t parentGid)
 
 void fxPruneExpiredMergeJobs()
 {
+  std::lock_guard<std::recursive_mutex> lock(fxMergeMutex);
   const auto now = std::time(nullptr);
   std::vector<a2_gid_t> expired;
   for (const auto& kv : fxMergeJobs) {
@@ -498,7 +526,7 @@ bool fxWaitForSegmentsReady(FxMergeJob& job, std::string& err)
   std::string lastErr;
 
   for (size_t attempt = 0; attempt < maxAttempts; ++attempt) {
-    if (job.cancelRequested) {
+    if (job.cancelRequested()) {
       err = "merge canceled by user";
       return false;
     }
@@ -604,7 +632,7 @@ bool fxConcatSegments(FxMergeJob& job, const std::string& partPath,
   const auto totalSegments = job.segmentPaths.size();
   size_t idx = 0;
   for (const auto& segmentPath : job.segmentPaths) {
-    if (job.cancelRequested) {
+    if (job.cancelRequested()) {
       err = "merge canceled by user";
       return false;
     }
@@ -856,7 +884,7 @@ bool fxRemuxSegments(FxMergeJob& job, const std::string& partPath,
     }
     if (w == 0) {
       drainFfmpegStderr();
-      if (job.cancelRequested) {
+      if (job.cancelRequested()) {
         kill(cpid, SIGTERM);
         for (size_t i = 0; i < 20; ++i) {
           w = waitpid(cpid, &status, WNOHANG);
@@ -934,14 +962,14 @@ bool fxRemuxSegments(FxMergeJob& job, const std::string& partPath,
 
 bool fxFinalizeMerge(FxMergeJob& job)
 {
-  if (job.cancelRequested) {
+  if (job.cancelRequested()) {
     fxMarkFailed(job, FX_MERGE_ERR_CANCELED, "merge canceled by user", true);
     return false;
   }
 
   std::string preflightErr;
   if (!fxWaitForSegmentsReady(job, preflightErr)) {
-    if (job.cancelRequested || preflightErr == "merge canceled by user") {
+    if (job.cancelRequested() || preflightErr == "merge canceled by user") {
       fxMarkFailed(job, FX_MERGE_ERR_CANCELED, "merge canceled by user", true);
     }
     else {
@@ -996,7 +1024,7 @@ bool fxFinalizeMerge(FxMergeJob& job)
       }
     }
     if (!ok) {
-      if (job.cancelRequested || err == "merge canceled by user") {
+      if (job.cancelRequested() || err == "merge canceled by user") {
         fxMarkFailed(job, FX_MERGE_ERR_CANCELED, "merge canceled by user", true);
       }
       else {
@@ -1008,7 +1036,7 @@ bool fxFinalizeMerge(FxMergeJob& job)
   else {
     ok = fxConcatSegments(job, partPath, err);
     if (!ok) {
-      if (job.cancelRequested || err == "merge canceled by user") {
+      if (job.cancelRequested() || err == "merge canceled by user") {
         fxMarkFailed(job, FX_MERGE_ERR_CANCELED, "merge canceled by user", true);
       }
       else {
@@ -1018,7 +1046,7 @@ bool fxFinalizeMerge(FxMergeJob& job)
     }
   }
 
-  if (job.cancelRequested) {
+  if (job.cancelRequested()) {
     fxMarkFailed(job, FX_MERGE_ERR_CANCELED, "merge canceled by user", true);
     return false;
   }
@@ -1048,7 +1076,7 @@ bool fxFinalizeMerge(FxMergeJob& job)
     }
     publishErrno = errno;
     publishError = std::strerror(publishErrno);
-    if (job.cancelRequested) {
+    if (job.cancelRequested()) {
       fxMarkFailed(job, FX_MERGE_ERR_CANCELED, "merge canceled by user", true);
       return false;
     }
@@ -1220,6 +1248,7 @@ std::unique_ptr<ValueBase> AddUriRpcMethod::process(const RpcRequest& req,
 // Returns the tmpDir the new job should use ("" = caller keeps its own default).
 std::string fxSupersedeOwnerForOverwrite(const std::string& outputPath, DownloadEngine* e)
 {
+  std::lock_guard<std::recursive_mutex> lock(fxMergeMutex);
   auto ownerItr = fxMergeOutputOwner.find(outputPath);
   if (ownerItr == fxMergeOutputOwner.end()) {
     return "";
@@ -1275,6 +1304,7 @@ std::string fxSupersedeOwnerForOverwrite(const std::string& outputPath, Download
 std::unique_ptr<ValueBase> FxplayerAddMergeRpcMethod::process(
     const RpcRequest& req, DownloadEngine* e)
 {
+  std::lock_guard<std::recursive_mutex> lock(fxMergeMutex);
   fxPruneExpiredMergeJobs();
 
   const List* segmentsParam = checkRequiredParam<List>(req, 0);
@@ -1456,6 +1486,17 @@ std::unique_ptr<ValueBase> FxplayerAddMergeRpcMethod::process(
 std::unique_ptr<ValueBase> FxplayerRetryMergeRpcMethod::process(
     const RpcRequest& req, DownloadEngine* e)
 {
+  // NOTE: still fully synchronous, unlike fxMergeOnGroupStopped's automatic path below — this holds
+  // fxMergeMutex (and blocks the whole event loop, same as before this hardening pass) for the entire
+  // ffmpeg remux. Deliberately NOT converted to the async pattern: the Swift RPC client
+  // (Aria2RPCClient.retryMerge / WebService.swift's "retry merge-only" path) explicitly depends on this
+  // call not returning until the file is actually merged on disk — see its own comment ("synchronous,
+  // the file is already merged by the time the call returns without throwing"). Converting this path
+  // too would need a coordinated client-side change (poll findMergeByOutput instead of awaiting this
+  // call) that's out of scope here. This is a rare, explicit, user-initiated action (the "retry" button
+  // on one failed download), unlike the automatic path, which fires on every single successful HLS
+  // download and is the one that actually mattered for daemon-wide responsiveness.
+  std::lock_guard<std::recursive_mutex> lock(fxMergeMutex);
   fxPruneExpiredMergeJobs();
 
   const String* gidParam = checkRequiredParam<String>(req, 0);
@@ -1504,6 +1545,7 @@ std::unique_ptr<ValueBase> FxplayerFindMergeByOutputRpcMethod::process(
     const RpcRequest& req, DownloadEngine* e)
 {
   (void)e;
+  std::lock_guard<std::recursive_mutex> lock(fxMergeMutex);
   fxPruneExpiredMergeJobs();
 
   const String* outputParam = checkRequiredParam<String>(req, 0);
@@ -1562,9 +1604,66 @@ std::unique_ptr<ValueBase> FxplayerFindMergeByOutputRpcMethod::process(
   return std::move(result);
 }
 
+// Runs fxFinalizeMerge's blocking sequence (segment-ready wait, ffmpeg fork/wait, disk I/O, the
+// publish-rename retry loop — collectively up to ~20+ seconds in the worst case, dominated by ffmpeg's
+// own remux time) on a background thread instead of the calling (main event-loop) thread. Before this,
+// EVERY successful HLS download's final segment landing synchronously froze the ENTIRE aria2 daemon —
+// every other concurrent download, every RPC call (progress polls, pause/cancel) — for however long the
+// remux took, since aria2's single-threaded reactor has nothing else to run while blocked in a usleep/
+// waitpid polling loop. (FxplayerRetryMergeRpcMethod::process — the OTHER caller of fxFinalizeMerge —
+// deliberately still calls it synchronously; see that function's own comment for why.)
+//
+// The worker operates on a VALUE COPY of the job, never touching fxMergeJobs/fxMergeChildToParent/
+// fxMergeOutputOwner except in its own writeback at the very end (under fxMergeMutex, briefly) — every
+// other step (fork/exec, waitpid, file I/O) works purely on the copy's data, so it needs no
+// synchronization at all. A cancel request set on the LIVE map entry while the worker is running is
+// still observed: FxMergeJob's cancelFlag is a shared_ptr to an atomic, so the copy and the original
+// alias the SAME underlying flag (see FxMergeJob's own comment).
+void fxFinalizeMergeAsync(a2_gid_t parentGid)
+{
+  FxMergeJob snapshot;
+  {
+    std::lock_guard<std::recursive_mutex> lock(fxMergeMutex);
+    auto itr = fxMergeJobs.find(parentGid);
+    if (itr == fxMergeJobs.end()) {
+      return;
+    }
+    itr->second.state = FX_MERGE_MERGING;
+    itr->second.mergeProgress = 0.0;
+    snapshot = itr->second;
+  }
+
+  std::thread([parentGid, snapshot]() mutable {
+    const bool ok = fxFinalizeMerge(snapshot);
+
+    std::lock_guard<std::recursive_mutex> lock(fxMergeMutex);
+    auto itr = fxMergeJobs.find(parentGid);
+    if (itr == fxMergeJobs.end()) {
+      // Erased/pruned/superseded (TTL eviction, or an overwrite=true retry reclaiming the output
+      // path) while the worker was running — nothing left to write the result into. Not a leak:
+      // whatever the worker published or left as a failure artifact sits at paths
+      // fxSupersedeOwnerForOverwrite/fxCleanupFailureArtifacts already know to look for.
+      return;
+    }
+    auto& job = itr->second;
+    job.state = snapshot.state;
+    job.errorCode = snapshot.errorCode;
+    job.errorMessage = snapshot.errorMessage;
+    job.mergeProgress = snapshot.mergeProgress;
+    job.cleanupPending = snapshot.cleanupPending;
+    job.cleanupDone = snapshot.cleanupDone;
+    job.terminalEpochSec = snapshot.terminalEpochSec;
+
+    if (!ok && job.cleanupPending && fxAllChildrenDone(job)) {
+      fxCleanupFailureArtifacts(job);
+    }
+  }).detach();
+}
+
 void fxMergeOnGroupStopped(const std::shared_ptr<RequestGroup>& group,
                            DownloadEngine* e, error_code::Value result)
 {
+  std::lock_guard<std::recursive_mutex> lock(fxMergeMutex);
   fxPruneExpiredMergeJobs();
 
   const auto gid = group->getGID();
@@ -1607,7 +1706,7 @@ void fxMergeOnGroupStopped(const std::shared_ptr<RequestGroup>& group,
                   static_cast<int>(result)));
 
   if (!ok) {
-    if (job.cancelRequested) {
+    if (job.cancelRequested()) {
       fxMarkFailed(job, FX_MERGE_ERR_CANCELED,
                    fmt("merge canceled by user during download gid=%s code=%d",
                        GroupId::toHex(gid).c_str(), static_cast<int>(result)),
@@ -1638,14 +1737,10 @@ void fxMergeOnGroupStopped(const std::shared_ptr<RequestGroup>& group,
     return;
   }
 
-  A2_LOG_WARN(fmt("[fxmerge] parent=%s all segments downloaded; starting merge mode=%s tmpDir=%s output=%s",
+  A2_LOG_WARN(fmt("[fxmerge] parent=%s all segments downloaded; starting merge (async) mode=%s tmpDir=%s output=%s",
                   GroupId::toHex(parent).c_str(), job.mode.c_str(),
                   job.tmpDir.c_str(), job.outputPath.c_str()));
-  if (!fxFinalizeMerge(job)) {
-    if (job.cleanupPending && fxAllChildrenDone(job)) {
-      fxCleanupFailureArtifacts(job);
-    }
-  }
+  fxFinalizeMergeAsync(parent);
 }
 
 namespace {
@@ -1780,6 +1875,7 @@ namespace {
 std::unique_ptr<ValueBase> removeDownload(const RpcRequest& req,
                                           DownloadEngine* e, bool forceRemove)
 {
+  std::lock_guard<std::recursive_mutex> lock(fxMergeMutex);
   fxPruneExpiredMergeJobs();
 
   const String* gidParam = checkRequiredParam<String>(req, 0);
@@ -1809,7 +1905,7 @@ std::unique_ptr<ValueBase> removeDownload(const RpcRequest& req,
       return createGIDResponse(gid);
     }
 
-    job.cancelRequested = true;
+    job.requestCancel();
 
     bool touched = false;
     for (auto childGid : job.childGids) {
@@ -2682,7 +2778,7 @@ void gatherFxMergeStatus(Dict* entryDict, const FxMergeJob& job,
     merge->put("downloadProgress", fmt("%.3f", downloadProgress));
     merge->put("estimatedDownloadProgress", fmt("%.3f", estimatedDownloadProgress));
     merge->put("overallProgress", fmt("%.3f", overallProgress));
-    merge->put("cancelRequested", job.cancelRequested ? VLB_TRUE : VLB_FALSE);
+    merge->put("cancelRequested", job.cancelRequested() ? VLB_TRUE : VLB_FALSE);
     merge->put("terminal", fxIsTerminalState(job.state) ? VLB_TRUE : VLB_FALSE);
     merge->put("retryable", retryable ? VLB_TRUE : VLB_FALSE);
     merge->put("outcome", outcome);
@@ -2694,6 +2790,11 @@ void gatherFxMergeStatus(Dict* entryDict, const FxMergeJob& job,
 std::unique_ptr<ValueBase> TellStatusRpcMethod::process(const RpcRequest& req,
                                                         DownloadEngine* e)
 {
+  // Only the merge-job branch just below touches fxMergeJobs, but locking the whole function (matching
+  // every other fxMerge* touchpoint) is simplest and cheap — an uncontended recursive_mutex lock/unlock
+  // is microseconds, not worth a narrower, easier-to-get-wrong scope for an RPC call already dominated
+  // by JSON building.
+  std::lock_guard<std::recursive_mutex> lock(fxMergeMutex);
   fxPruneExpiredMergeJobs();
 
   const String* gidParam = checkRequiredParam<String>(req, 0);
