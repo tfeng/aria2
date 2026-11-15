@@ -58,6 +58,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <functional>
 #ifdef __linux__
 #include <sys/prctl.h>
 #endif
@@ -93,6 +94,11 @@
 #include "MessageDigest.h"
 #include "message_digest_helper.h"
 #include "OpenedFileCounter.h"
+#include "json.h"
+#include "ValueBaseJsonParser.h"
+#include "GroupId.h"
+#include "File.h"
+#include "FxTelegram.h"
 #ifdef ENABLE_BITTORRENT
 #  include "bittorrent_helper.h"
 #  include "BtRegistry.h"
@@ -233,6 +239,16 @@ struct FxMergeJob {
   // 2026-11-14: a finished segment's size, looked up once (gatherFxMergeStatus used to stat every segment file on
   // every tellStatus poll, on the main thread).
   std::map<a2_gid_t, int64_t> finishedSize;
+  // 2026-11-14: a Telegram job (addMerge's one segment is {"telegram": {chatId, msgId}}). Its one "child" is the job
+  // itself (childGids = {parentGid}, no RequestGroup): FxTelegram downloads the message's file and reports back
+  // through fxMergeOnChildReported like a finished segment, and segmentPaths/childPath name TDLib's file from then
+  // on. Everything after the download -- remux, probe, publish, stop/retry/remove, status -- is the shared code.
+  bool telegram = false;
+  int64_t tgChatId = 0;
+  int64_t tgMsgId = 0;
+  int64_t tgExpectedSize = 0;
+  bool tgReleased = false; // TDLib's copy released after publishing (fxReleaseTelegramCopy)
+  std::shared_ptr<GroupId> tgGroupId; // reserves parentGid (an HTTP job's parent RequestGroup does that)
 };
 
 // Guards fxMergeJobs/fxMergeChildToParent/fxMergeOutputOwner. Every access to these three maps used to
@@ -276,6 +292,9 @@ std::map<a2_gid_t, a2_gid_t> fxMergeChildToParent;
 // (fxForgetMergeChild, from RequestGroupMan) or when the child is dropped from the queue without ever running.
 std::set<a2_gid_t> fxEverMergeChildren;
 std::map<std::string, a2_gid_t> fxMergeOutputOwner;
+// The request each job was added with (its params after the RPC token was stripped), by parent GID, for the jobs
+// file (fxTick): after a restart a job still running is added again from it, under the same GID, by fxAddMerge.
+std::map<a2_gid_t, std::string> fxJobRequests;
 
 const int FX_MERGE_ERR_SEGMENT = 2000;
 const int FX_MERGE_ERR_CONCAT_IO = 2001;
@@ -294,6 +313,12 @@ const int FX_MERGE_ERR_STOPPED = 2009;
 // far shorter than expected). ffmpeg -c copy can exit 0 and still write a stream-less 262-byte MP4 (seen
 // 2026-08-06 on an xHamster AV1 save). Merge-phase failure: segments are not reused on resubmit.
 const int FX_MERGE_ERR_INVALID_OUTPUT = 2010;
+// 2026-11-14: Telegram jobs. 2011: the message is gone, not accessible, or has no video (not retryable; nothing
+// kept). 2012: the server's Telegram account isn't signed in. 2013: any other Telegram failure. 2012 and 2013 are
+// download-phase failures like 2000: TDLib keeps the partial file and the next attempt resumes from it.
+const int FX_MERGE_ERR_TG_UNAVAILABLE = 2011;
+const int FX_MERGE_ERR_TG_NOT_AUTHORIZED = 2012;
+const int FX_MERGE_ERR_TG_FAILED = 2013;
 
 const std::time_t FX_MERGE_JOB_TTL_SECONDS = 30 * 60;
 
@@ -357,6 +382,7 @@ void fxEraseMergeJob(a2_gid_t parentGid)
     fxMergeOutputOwner.erase(outIt);
   }
 
+  fxJobRequests.erase(parentGid);
   fxMergeJobs.erase(it);
 }
 
@@ -846,15 +872,17 @@ bool fxKeptSegments(const FxMergeJob& job)
   // Download-phase failures only: after a concat/remux/rename failure the segments themselves may be the
   // problem, so a full retry downloads them again (as before 2026-11-08) instead of re-merging the same files.
   const bool downloadPhase = job.errorCode == FX_MERGE_ERR_SEGMENT ||
-                             job.errorCode == FX_MERGE_ERR_LINK_EXPIRED || job.errorCode == FX_MERGE_ERR_STOPPED;
+                             job.errorCode == FX_MERGE_ERR_LINK_EXPIRED || job.errorCode == FX_MERGE_ERR_STOPPED ||
+                             job.errorCode == FX_MERGE_ERR_TG_NOT_AUTHORIZED || job.errorCode == FX_MERGE_ERR_TG_FAILED;
   return job.state == FX_MERGE_FAILED && downloadPhase && !job.cleanupPending && !job.cleanupDone;
 }
 
-// Whether a download-phase failure keeps `job`'s segments for the next attempt: only multi-segment jobs. A
-// single-file job (playlist fetch, thumbnail, trailer) has nothing worth resuming and is cleaned up as before.
+// Whether a download-phase failure keeps `job`'s segments for the next attempt: multi-segment jobs and Telegram
+// jobs (TDLib's partial file of a multi-GB video). A single-file HTTP job (playlist fetch, thumbnail, trailer) has
+// nothing worth resuming and is cleaned up as before.
 bool fxKeepsSegmentsOnFailure(const FxMergeJob& job)
 {
-  return job.childGids.size() > 1;
+  return job.telegram || job.childGids.size() > 1;
 }
 
 // Name of the per-job list of segments aria2 itself finished (one file name per line), in its tmpDir. Only a
@@ -1152,6 +1180,59 @@ void fxAdoptDefaultTmpDir(FxMergeJob& job)
                   oldDir.c_str(), defaultDir.c_str()));
 }
 
+// A Telegram job's file is TDLib's (in --fx-telegram-dir), not the job's: two jobs for the same message -- an
+// overwrite retry while the old one is still merging, or the same video saved twice -- download and read the same
+// file. Whether a job other than `exceptGid` still needs the message's file. Caller holds fxMergeMutex.
+bool fxTelegramCopyInUse(int64_t chatId, int64_t msgId, a2_gid_t exceptGid)
+{
+  for (const auto& kv : fxMergeJobs) {
+    const auto& other = kv.second;
+    if (kv.first == exceptGid || !other.telegram || other.tgChatId != chatId || other.tgMsgId != msgId) {
+      continue;
+    }
+    if (!fxIsTerminalState(other.state) || fxKeptSegments(other) || fxIsRetryable(other)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Deletes TDLib's copy of a Telegram job's file -- the file itself when the job got that far, and TDLib's record of
+// it (a partial file too) -- unless another job still needs it. Called when the job is published, cleaned up or
+// deleted. Caller holds fxMergeMutex.
+void fxReleaseTelegramCopy(const FxMergeJob& job)
+{
+  if (!job.telegram || fxTelegramCopyInUse(job.tgChatId, job.tgMsgId, job.parentGid)) {
+    return;
+  }
+  for (const auto& path : job.segmentPaths) {
+    File(path).remove();
+  }
+  fxtg::discard(job.tgChatId, job.tgMsgId);
+}
+
+// FX_TELEGRAM_MARKER in a Telegram job's tmpDir names its message ("<chatId> <msgId>"), written once TDLib has some of
+// the file. A kept or retryable job's record expires (30 min) and doesn't survive a restart, while TDLib keeps the
+// file: fxplayer.removeMergeOutput finds the message here when the app deletes the save later.
+const char FX_TELEGRAM_MARKER[] = ".fx-telegram";
+
+void fxWriteTelegramMarker(const FxMergeJob& job)
+{
+  File(job.tmpDir).mkdirs();
+  std::ofstream out(util::applyDir(job.tmpDir, FX_TELEGRAM_MARKER), std::ios::trunc);
+  out << job.tgChatId << ' ' << job.tgMsgId << '\n';
+}
+
+// Before a segments directory is deleted without its job: the message of a Telegram save, to discard TDLib's copy.
+void fxReleaseTelegramMarker(const std::string& dir)
+{
+  std::ifstream in(util::applyDir(dir, FX_TELEGRAM_MARKER));
+  long long chatId = 0, msgId = 0;
+  if (in >> chatId >> msgId && chatId != 0 && msgId > 0 && !fxTelegramCopyInUse(chatId, msgId, 0)) {
+    fxtg::discard(chatId, msgId);
+  }
+}
+
 void fxCleanupFailureArtifacts(FxMergeJob& job)
 {
   if (job.cleanupDone) {
@@ -1163,8 +1244,13 @@ void fxCleanupFailureArtifacts(FxMergeJob& job)
   File(fxMergePartPath(job)).remove();
   File(listPath).remove();
   File(playlistPath).remove();
-  for (const auto& segmentPath : job.segmentPaths) {
-    File(segmentPath).remove();
+  if (job.telegram) {
+    fxReleaseTelegramCopy(job); // TDLib's partial or complete copy, and its record of it
+  }
+  else {
+    for (const auto& segmentPath : job.segmentPaths) {
+      File(segmentPath).remove();
+    }
   }
   fxRemoveTree(job.tmpDir);
   A2_LOG_INFO(fmt("[fxmerge] parent=%s cleanup complete tmpDir=%s",
@@ -1235,6 +1321,14 @@ void fxFinishCancelIfNothingRunning(FxMergeJob& job)
 void fxHaltRemainingChildren(FxMergeJob& job, DownloadEngine* e)
 {
   size_t halted = 0, dropped = 0;
+  if (job.telegram) {
+    // The one "child" is FxTelegram's download; its CANCELED report arrives on the next tick (fxTick), like a
+    // halted RequestGroup's.
+    if (!job.childDone[job.parentGid]) {
+      fxtg::stop(job.parentGid);
+      ++halted;
+    }
+  }
   for (auto childGid : job.childGids) {
     if (job.childDone[childGid]) {
       continue;
@@ -1705,7 +1799,10 @@ bool fxRemuxSegments(FxMergeJob& job, const std::string& partPath,
     }
   }
 
-  if (isTsSegmentBundle && outputMpegTs) {
+  if (job.telegram) {
+    // One complete file (TDLib's download): ffmpeg reads it directly -- see the args below.
+  }
+  else if (isTsSegmentBundle && outputMpegTs) {
     std::ofstream concatList(concatListPath.c_str(), std::ios::binary | std::ios::trunc);
     if (!concatList) {
       err = "could not write ffmpeg concat list";
@@ -1742,7 +1839,19 @@ bool fxRemuxSegments(FxMergeJob& job, const std::string& partPath,
 
   std::vector<std::string> args = {"-y", "-hide_banner", "-loglevel", "error", "-xerror", "-err_detect",
                                    "crccheck+bitstream+buffer+explode"};
-  if (isTsSegmentBundle && outputMpegTs) {
+  if (job.telegram) {
+    // Video (0:V = video streams that aren't cover art) and every audio track: what the HLS path carries too.
+    // Subtitles and attachments are left out -- an MKV's ASS/SRT or fonts have no MP4 equivalent and would fail
+    // the whole -c copy.
+    args.insert(args.end(), {"-i", job.segmentPaths.front(), "-map", "0:V", "-map", "0:a?", "-c", "copy"});
+    if (outputMpegTs) {
+      args.insert(args.end(), {"-f", "mpegts"});
+    }
+    else {
+      args.insert(args.end(), {"-movflags", "+faststart", "-f", "mp4"});
+    }
+  }
+  else if (isTsSegmentBundle && outputMpegTs) {
     args.insert(args.end(), {"-f", "concat", "-safe", "0", "-i", concatListPath, "-c", "copy", "-f", "mpegts"});
   }
   else {
@@ -2083,8 +2192,12 @@ bool fxFinalizeMerge(FxMergeJob& job)
     }
   }
 
-  for (const auto& segmentPath : job.segmentPaths) {
-    File(segmentPath).remove();
+  // A Telegram job's input is TDLib's file, which another job for the same message may still need: fxTick releases it
+  // (fxReleaseTelegramCopy) once this job shows as merged.
+  if (!job.telegram) {
+    for (const auto& segmentPath : job.segmentPaths) {
+      File(segmentPath).remove();
+    }
   }
   fxRemoveTree(job.tmpDir);
 
@@ -2330,15 +2443,37 @@ void fxSupersedeOwnerForOverwrite(const std::string& outputPath, DownloadEngine*
                                         // children report done, then self-cleans as usual.
 }
 
-std::unique_ptr<ValueBase> FxplayerAddMergeRpcMethod::process(
-    const RpcRequest& req, DownloadEngine* e)
+namespace {
+// The parameter at `index` of `params` as T: nullptr when absent (or JSON null); an error when it has another type.
+template <typename T> const T* fxParamAt(const List* params, size_t index, bool required)
+{
+  const ValueBase* v = params && index < params->size() ? params->get(index) : nullptr;
+  if (!v || downcast<Null>(v)) {
+    if (required) {
+      throw DL_ABORT_EX(fmt("The parameter at %lu is required but missing.", static_cast<unsigned long>(index)));
+    }
+    return nullptr;
+  }
+  const T* t = downcast<T>(v);
+  if (!t) {
+    throw DL_ABORT_EX(fmt("The parameter at %lu has wrong type.", static_cast<unsigned long>(index)));
+  }
+  return t;
+}
+} // namespace
+
+// fxplayer.addMerge's whole implementation, shared by the RPC and the jobs-file restore (2026-11-14).
+// `restoreGid` (0 = a new job) re-creates a job under the GID it had before the restart, so the app's stored GID
+// keeps working. Returns the job's parent GID.
+a2_gid_t fxAddMerge(const List* params, DownloadEngine* e, a2_gid_t restoreGid,
+                    const std::function<void(Option*, const Dict*)>& gatherRequestOption)
 {
   std::lock_guard<std::recursive_mutex> lock(fxMergeMutex);
   fxPruneExpiredMergeJobs();
 
-  const List* segmentsParam = checkRequiredParam<List>(req, 0);
-  const Dict* aria2OptsParam = checkParam<Dict>(req, 1);
-  const Dict* mergeOptsParam = checkParam<Dict>(req, 2);
+  const List* segmentsParam = fxParamAt<List>(params, 0, true);
+  const Dict* aria2OptsParam = fxParamAt<Dict>(params, 1, false);
+  const Dict* mergeOptsParam = fxParamAt<Dict>(params, 2, false);
 
   std::string outputPathForLog = "<unknown>";
   std::string tmpDirForLog = "<unknown>";
@@ -2377,7 +2512,7 @@ std::unique_ptr<ValueBase> FxplayerAddMergeRpcMethod::process(
                           outputPath.c_str(),
                           GroupId::toHex(ownerItr->second).c_str(),
                           fxMergeStateName(existing->second.state)));
-          return createGIDResponse(ownerItr->second);
+          return ownerItr->second;
         }
         throw DL_ABORT_EX(fmt("merge output collision: output already claimed by GID#%s state=%s",
                               GroupId::toHex(ownerItr->second).c_str(),
@@ -2461,6 +2596,70 @@ std::unique_ptr<ValueBase> FxplayerAddMergeRpcMethod::process(
       getFxDomainVolumeBudgetExternal(mergeOptsParam, "domainVolumeBudgetExternal");
   const auto fxDomainVideoGaps = getFxDomainVideoGaps(mergeOptsParam, "domainVideoGapMs");
 
+  // A Telegram job (2026-11-14): exactly one segment, {"telegram": {"chatId", "msgId", "size"?}}, downloaded by
+  // FxTelegram instead of a RequestGroup. Everything else about the job is shared.
+  const Dict* telegramSource = nullptr;
+  for (auto& elem : *segmentsParam) {
+    if (const auto* d = downcast<Dict>(elem)) {
+      if (const auto* t = downcast<Dict>(d->get("telegram"))) {
+        if (segmentsParam->size() != 1) {
+          throw DL_ABORT_EX("a telegram source must be the job's only segment.");
+        }
+        telegramSource = t;
+      }
+    }
+  }
+  if (telegramSource) {
+    const auto* chatParam = getIntegerField(telegramSource, "chatId");
+    const auto* msgParam = getIntegerField(telegramSource, "msgId");
+    if (!chatParam || !msgParam || chatParam->i() == 0 || msgParam->i() <= 0) {
+      throw DL_ABORT_EX("telegram source needs non-zero integer 'chatId' and positive 'msgId'.");
+    }
+    if (!fxtg::configured()) {
+      throw DL_ABORT_EX("Telegram downloads are not configured on this aria2 (--fx-telegram-helper).");
+    }
+    std::shared_ptr<GroupId> groupId = restoreGid != 0 ? GroupId::import(restoreGid) : GroupId::create();
+    if (!groupId) {
+      throw DL_ABORT_EX(fmt("GID %s is not unique.", GroupId::toHex(restoreGid).c_str()));
+    }
+    if (supersedeOwner) {
+      fxSupersedeOwnerForOverwrite(outputPath, e);
+    }
+    else if (dropStaleOwner) {
+      fxMergeOutputOwner.erase(outputPath);
+    }
+    const auto parentGid = groupId->getNumericId();
+    FxMergeJob job;
+    job.parentGid = parentGid;
+    job.tgGroupId = groupId;
+    job.telegram = true;
+    job.tgChatId = chatParam->i();
+    job.tgMsgId = msgParam->i();
+    if (const auto* sizeParam = getIntegerField(telegramSource, "size")) {
+      job.tgExpectedSize = std::max<int64_t>(0, sizeParam->i());
+    }
+    job.outputPath = outputPath;
+    job.tmpDir = tmpDir;
+    job.mode = mode;
+    job.remux = remux;
+    if (const auto* expectedDuration = getIntegerField(mergeOptsParam, "expectedDurationSeconds")) {
+      job.expectedDurationSec = std::max<int64_t>(0, expectedDuration->i());
+    }
+    job.state = FX_MERGE_DOWNLOADING;
+    job.childGids.push_back(parentGid);
+    job.childDone[parentGid] = false;
+    job.childOK[parentGid] = true;
+    fxMergeJobs[parentGid] = job;
+    fxMergeOutputOwner[outputPath] = parentGid;
+    fxJobRequests[parentGid] = json::encode(params);
+    fxtg::start(parentGid, job.tgChatId, job.tgMsgId);
+    A2_LOG_WARN(fmt("[fxmerge] add parent=%s telegram chat=%" PRId64 " msg=%" PRId64
+                    " mode=%s tmpDir=%s output=%s overwrite=%s%s",
+                    GroupId::toHex(parentGid).c_str(), job.tgChatId, job.tgMsgId, mode.c_str(), tmpDir.c_str(),
+                    outputPath.c_str(), overwrite ? "true" : "false", restoreGid != 0 ? " (restored)" : ""));
+    return parentGid;
+  }
+
   // Do NOT touch tmpDir synchronously here. On SMB targets this can block JSON-RPC for
   // tens of seconds while a spun-down drive wakes up, causing client-side submit timeouts.
   // RequestGroup disk setup will create/use directories lazily when downloads actually start.
@@ -2518,6 +2717,9 @@ std::unique_ptr<ValueBase> FxplayerAddMergeRpcMethod::process(
     auto requestOption = std::make_shared<Option>(*baseRequestOption);
     const auto filename = fxSegmentFileName(index, uri);
     requestOption->put(PREF_OUT, filename);
+    if (index == 0 && restoreGid != 0) {
+      requestOption->put(PREF_GID, GroupId::toHex(restoreGid)); // the parent keeps its GID across the restart
+    }
 
     std::vector<std::shared_ptr<RequestGroup>> created;
     createRequestGroupForUri(created, requestOption, std::vector<std::string>{uri},
@@ -2594,6 +2796,7 @@ std::unique_ptr<ValueBase> FxplayerAddMergeRpcMethod::process(
   }
   fxMergeJobs[parentGid] = job;
   fxMergeOutputOwner[outputPath] = parentGid;
+  fxJobRequests[parentGid] = json::encode(params);
 
   // FXPlayer (2026-11-07): one video identity across this video's jobs for the video-boundary gap.
   if (const auto* videoGroupParam = getStringField(mergeOptsParam, "videoGroup")) {
@@ -2603,13 +2806,13 @@ std::unique_ptr<ValueBase> FxplayerAddMergeRpcMethod::process(
   }
   e->getRequestGroupMan()->addReservedGroup(groups);
 
-  A2_LOG_WARN(fmt("[fxmerge] add parent=%s segments=%lu mode=%s remux=%s tmpDir=%s output=%s overwrite=%s",
+  A2_LOG_WARN(fmt("[fxmerge] add parent=%s segments=%lu mode=%s remux=%s tmpDir=%s output=%s overwrite=%s%s",
                   GroupId::toHex(parentGid).c_str(),
                   static_cast<unsigned long>(groups.size()), mode.c_str(),
                   remux ? "true" : "false", tmpDir.c_str(),
-                  outputPath.c_str(), overwrite ? "true" : "false"));
+                  outputPath.c_str(), overwrite ? "true" : "false", restoreGid != 0 ? " (restored)" : ""));
 
-  return createGIDResponse(parentGid);
+  return parentGid;
   }
   catch (RecoverableException& ex) {
     const auto op = fxMergeOperationFromOutputPath(outputPathForLog);
@@ -2618,6 +2821,18 @@ std::unique_ptr<ValueBase> FxplayerAddMergeRpcMethod::process(
                      modeForLog.c_str(), tmpDirForLog.c_str(), ex.what()));
     throw DL_ABORT_EX(fmt("unable to %s with aria2: %s", op.c_str(), ex.what()));
   }
+}
+
+std::unique_ptr<ValueBase> FxplayerAddMergeRpcMethod::process(
+    const RpcRequest& req, DownloadEngine* e)
+{
+  return createGIDResponse(addJob(req.params.get(), e, 0));
+}
+
+a2_gid_t FxplayerAddMergeRpcMethod::addJob(const List* params, DownloadEngine* e, a2_gid_t restoreGid)
+{
+  return fxAddMerge(params, e, restoreGid,
+                    [this](Option* option, const Dict* dict) { gatherRequestOption(option, dict); });
 }
 
 std::unique_ptr<ValueBase> FxplayerRetryMergeRpcMethod::process(
@@ -2915,6 +3130,7 @@ std::unique_ptr<ValueBase> FxplayerRemoveMergeOutputRpcMethod::process(const Rpc
       }
       closedir(d);
       for (const auto& name : names) {
+        fxReleaseTelegramMarker(util::applyDir(dir, name));
         if (fxRemoveTree(util::applyDir(dir, name))) {
           ++removed;
         }
@@ -2927,6 +3143,74 @@ std::unique_ptr<ValueBase> FxplayerRemoveMergeOutputRpcMethod::process(const Rpc
   result->put("removed", util::uitos(removed));
   result->put("live", live ? VLB_TRUE : VLB_FALSE);
   return std::move(result);
+}
+
+namespace {
+std::unique_ptr<ValueBase> fxTelegramAuthStateResponse()
+{
+  const auto st = fxtg::authState();
+  auto result = Dict::g();
+  result->put("configured", st.configured ? VLB_TRUE : VLB_FALSE);
+  result->put("state", st.state);
+  if (!st.detail.empty()) {
+    result->put("detail", st.detail);
+  }
+  if (!st.error.empty()) {
+    result->put("error", st.error);
+  }
+  return std::move(result);
+}
+} // namespace
+
+std::unique_ptr<ValueBase> FxplayerTelegramAuthStateRpcMethod::process(const RpcRequest& req, DownloadEngine* e)
+{
+  (void)req;
+  (void)e;
+  return fxTelegramAuthStateResponse();
+}
+
+std::unique_ptr<ValueBase> FxplayerTelegramAuthRpcMethod::process(const RpcRequest& req, DownloadEngine* e)
+{
+  (void)e;
+  const Dict* step = checkRequiredParam<Dict>(req, 0);
+  if (!fxtg::configured()) {
+    throw DL_ABORT_EX("Telegram downloads are not configured on this aria2 (--fx-telegram-helper).");
+  }
+  // One step per call; the order is TDLib's (credentials -> phone or qr -> code -> password). Values are never logged.
+  const char* stepName = nullptr;
+  if (const auto* apiIdParam = getIntegerField(step, "apiId")) {
+    const auto* apiHashParam = getStringField(step, "apiHash");
+    if (apiIdParam->i() <= 0 || !apiHashParam || apiHashParam->s().empty()) {
+      throw DL_ABORT_EX("telegramAuth: 'apiId' needs a positive integer and a non-empty 'apiHash'.");
+    }
+    fxtg::setCredentials(apiIdParam->i(), apiHashParam->s());
+    stepName = "apiId+apiHash";
+  }
+  else if (const auto* phone = getStringField(step, "phone")) {
+    fxtg::submitPhone(phone->s());
+    stepName = "phone";
+  }
+  else if (const auto* code = getStringField(step, "code")) {
+    fxtg::submitCode(code->s());
+    stepName = "code";
+  }
+  else if (getBoolField(step, "qr", false)) {
+    fxtg::requestQrLogin();
+    stepName = "qr";
+  }
+  else if (const auto* password = getStringField(step, "password")) {
+    fxtg::submitPassword(password->s());
+    stepName = "password";
+  }
+  else if (getBoolField(step, "logOut", false)) {
+    fxtg::logOut();
+    stepName = "logOut";
+  }
+  else {
+    throw DL_ABORT_EX("telegramAuth: expected one of apiId+apiHash, phone, qr, code, password, logOut.");
+  }
+  A2_LOG_WARN(fmt("[fxtg] sign-in step submitted: %s (state was %s)", stepName, fxtg::authState().state.c_str()));
+  return fxTelegramAuthStateResponse();
 }
 
 std::unique_ptr<ValueBase> FxplayerReadTextOutputRpcMethod::process(
@@ -3055,6 +3339,7 @@ void fxFinalizeMergeAsync(a2_gid_t parentGid)
       if (snapshot.state == FX_MERGE_MERGED) {
         A2_LOG_WARN(fmt("[fxmerge] parent=%s published output=%s after its job record was removed",
                         GroupId::toHex(parentGid).c_str(), snapshot.outputPath.c_str()));
+        fxReleaseTelegramCopy(snapshot);
       }
       return;
     }
@@ -3069,6 +3354,7 @@ void fxFinalizeMergeAsync(a2_gid_t parentGid)
         A2_LOG_WARN(fmt("[fxmerge] parent=%s published output=%s although it was %s meanwhile; keeping state=%s",
                         GroupId::toHex(parentGid).c_str(), job.outputPath.c_str(),
                         ownerChanged ? "superseded" : "finished", fxMergeStateName(job.state)));
+        fxReleaseTelegramCopy(snapshot);
       }
       fxSettleFailedJob(job);
       return;
@@ -3100,6 +3386,8 @@ void fxForgetMergeChild(a2_gid_t gid)
 }
 
 void fxMergeOnAllChildrenDone(FxMergeJob& job, a2_gid_t parent);
+void fxMergeOnChildReported(FxMergeJob& job, a2_gid_t parent, a2_gid_t gid, bool ok, int failCode,
+                            const std::string& failMessage, int resultForLog, DownloadEngine* e);
 
 namespace {
 // The expiry XNXX's and XVideos' CDNs sign into a media URL's path: ".../<token>,<unix seconds>/...".
@@ -3289,15 +3577,28 @@ void fxMergeOnGroupStopped(const std::shared_ptr<RequestGroup>& group,
   if (jobItr == fxMergeJobs.end()) {
     return;
   }
-  auto& job = jobItr->second;
+  const bool ok = result == error_code::FINISHED;
+  fxMergeOnChildReported(jobItr->second, parent, gid, ok, FX_MERGE_ERR_SEGMENT,
+                         fmt("segment download failed gid=%s code=%d", GroupId::toHex(gid).c_str(),
+                             static_cast<int>(result)),
+                         static_cast<int>(result), e);
+}
+
+// One child of `job` finished (`ok`) or failed: a segment's RequestGroup stopping (fxMergeOnGroupStopped) or a
+// Telegram job's download reporting (fxTick). A failure fails the whole job with `failCode`/`failMessage` (a
+// cancel wins), keeping the downloaded data when fxKeepsSegmentsOnFailure says so and the code allows it (2011,
+// message gone, never does). Once every child has reported, the merge starts. Caller holds fxMergeMutex.
+void fxMergeOnChildReported(FxMergeJob& job, a2_gid_t parent, a2_gid_t gid, bool ok, int failCode,
+                            const std::string& failMessage, int resultForLog, DownloadEngine* e)
+{
   if (job.state == FX_MERGE_MERGED) {
     return;
   }
 
   job.childDone[gid] = true;
-  const bool ok = result == error_code::FINISHED;
   job.childOK[gid] = ok;
-  if (ok && fxKeepsSegmentsOnFailure(job)) {
+  // (A Telegram job's file lives in TDLib's directory, which keeps its own record; nothing to list.)
+  if (ok && fxKeepsSegmentsOnFailure(job) && !job.telegram) {
     auto pathItr = job.childPath.find(gid);
     if (pathItr != job.childPath.end()) {
       fxNoteSegmentCompleted(job, File(pathItr->second).getBasename());
@@ -3310,24 +3611,20 @@ void fxMergeOnGroupStopped(const std::shared_ptr<RequestGroup>& group,
   }
 
   A2_LOG_INFO(fmt("[fxmerge] child-stop parent=%s child=%s result=%d",
-                  GroupId::toHex(parent).c_str(), GroupId::toHex(gid).c_str(),
-                  static_cast<int>(result)));
+                  GroupId::toHex(parent).c_str(), GroupId::toHex(gid).c_str(), resultForLog));
 
   if (!ok) {
     if (job.cancelRequested()) {
       fxMarkFailed(job, FX_MERGE_ERR_CANCELED,
                    fmt("merge canceled by user during download gid=%s code=%d",
-                       GroupId::toHex(gid).c_str(), static_cast<int>(result)),
+                       GroupId::toHex(gid).c_str(), resultForLog),
                    true);
     }
     else {
       // Segments kept (2026-11-08): the next attempt of this save resumes from them instead of
       // downloading the whole video again. Deleting the save in the app removes them.
-      fxMarkFailed(
-          job, FX_MERGE_ERR_SEGMENT,
-          fmt("segment download failed gid=%s code=%d",
-              GroupId::toHex(gid).c_str(), static_cast<int>(result)),
-          !fxKeepsSegmentsOnFailure(job));
+      fxMarkFailed(job, failCode, failMessage,
+                   !fxKeepsSegmentsOnFailure(job) || failCode == FX_MERGE_ERR_TG_UNAVAILABLE);
     }
     // One failed segment fails the whole video, so the rest are wasted requests (and with
     // expired links, a stream of 410s that also eats the volume budget). Stop them now.
@@ -3373,6 +3670,220 @@ void fxMergeOnAllChildrenDone(FxMergeJob& job, a2_gid_t parent)
              GroupId::toHex(parent).c_str(), static_cast<unsigned long>(job.skippedCount),
              job.mode.c_str(), job.tmpDir.c_str(), job.outputPath.c_str()));
   fxFinalizeMergeAsync(parent);
+}
+
+namespace {
+// The jobs file (2026-11-14): --fx-jobs-file, else "fx-jobs.json" next to --save-session; "" = none.
+std::string fxJobsFilePath(DownloadEngine* e)
+{
+  const auto& op = e->getOption();
+  if (op->defined(PREF_FX_JOBS_FILE) && !op->get(PREF_FX_JOBS_FILE).empty()) {
+    return op->get(PREF_FX_JOBS_FILE);
+  }
+  const auto& session = op->get(PREF_SAVE_SESSION);
+  if (session.empty()) {
+    return "";
+  }
+  const auto dir = File(session).getDirname();
+  return dir.empty() ? std::string("fx-jobs.json") : util::applyDir(dir, "fx-jobs.json");
+}
+
+// What fxPersistJobs last wrote (or found at startup), so an unchanged set isn't rewritten every tick.
+std::string fxJobsFileWritten;
+// After a failed write, the next attempt waits until then (not every tick), even without a change.
+std::chrono::steady_clock::time_point fxJobsFileRetryAt;
+
+// Every job still queued or downloading, with the request it was added with. Caller holds fxMergeMutex.
+std::string fxJobsFileContent()
+{
+  std::string out = "{\"version\":1,\"jobs\":[";
+  bool first = true;
+  for (const auto& kv : fxMergeJobs) {
+    const auto& job = kv.second;
+    if (fxIsTerminalState(job.state) || job.cancelRequested()) {
+      continue; // (a job merging at a restart is restored too: its segments are on disk, so it merges again)
+    }
+    auto req = fxJobRequests.find(kv.first);
+    if (req == fxJobRequests.end()) {
+      continue;
+    }
+    out += first ? "" : ",";
+    first = false;
+    out += "{\"gid\":\"" + GroupId::toHex(kv.first) + "\",\"params\":" + req->second + "}";
+  }
+  out += "]}";
+  return out;
+}
+
+// Writes the jobs file when its content changed: temporary file (0600 -- it holds the jobs' cookies), fsync, rename.
+void fxPersistJobs(const std::string& path)
+{
+  const auto content = fxJobsFileContent();
+  const auto now = std::chrono::steady_clock::now();
+  if (content == fxJobsFileWritten || now < fxJobsFileRetryAt) {
+    return;
+  }
+  const auto tmp = path + ".tmp";
+  const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  bool ok = fd >= 0;
+  for (size_t off = 0; ok && off < content.size();) {
+    const ssize_t n = ::write(fd, content.data() + off, content.size() - off);
+    if (n < 0 && errno == EINTR) {
+      continue;
+    }
+    ok = n > 0;
+    off += ok ? static_cast<size_t>(n) : 0;
+  }
+  ok = ok && ::fsync(fd) == 0;
+  const int err = errno;
+  if (fd >= 0) {
+    ::close(fd);
+  }
+  if (!ok || rename(tmp.c_str(), path.c_str()) != 0) {
+    // Retried in 30 s (not every tick, and not only on the next change: a full disk may clear up).
+    A2_LOG_ERROR(fmt("[fxmerge] could not write jobs file %s errno=%d; retrying in 30s", path.c_str(),
+                     ok ? errno : err));
+    unlink(tmp.c_str());
+    fxJobsFileRetryAt = now + std::chrono::seconds(30);
+    return;
+  }
+  fxJobsFileWritten = content;
+}
+
+// Adds every job of the jobs file again, under its old GID, exactly as the app first sent it: each request's
+// pacing, budget and per-domain settings come back with it, a segment already on disk is reused (.fx-completed),
+// an expired signed link fails the job locally (2008) without being requested, and a Telegram download resumes
+// from TDLib's partial file. Caller holds fxMergeMutex.
+// A jobs file larger than this is not read (each job's request is a few hundred KB at most).
+const int64_t FX_JOBS_FILE_MAX = 256 * 1024 * 1024;
+
+// Moves an unusable jobs file aside (it is about to be replaced by the next fxPersistJobs) so its jobs can still be
+// looked at; keeps its 0600 mode.
+void fxSetAsideJobsFile(const std::string& path, const char* why)
+{
+  const auto aside = path + ".unreadable";
+  if (rename(path.c_str(), aside.c_str()) == 0) {
+    A2_LOG_ERROR(fmt("[fxmerge] jobs file %s %s; no jobs restored (kept as %s)", path.c_str(), why, aside.c_str()));
+  }
+  else {
+    A2_LOG_ERROR(fmt("[fxmerge] jobs file %s %s; no jobs restored", path.c_str(), why));
+  }
+}
+
+void fxRestoreJobs(const std::string& path, DownloadEngine* e)
+{
+  File file(path);
+  if (!file.exists()) {
+    return;
+  }
+  if (file.size() > FX_JOBS_FILE_MAX) {
+    fxSetAsideJobsFile(path, "is too large");
+    return;
+  }
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    A2_LOG_ERROR(fmt("[fxmerge] could not open jobs file %s errno=%d; no jobs restored", path.c_str(), errno));
+    return;
+  }
+  std::stringstream ss;
+  ss << in.rdbuf();
+  const auto text = ss.str();
+  ssize_t error = 0;
+  auto root = json::ValueBaseJsonParser().parseFinal(text.c_str(), text.size(), error);
+  const auto* jobs = error < 0 ? nullptr : downcast<List>(downcast<Dict>(root.get())
+                                                              ? downcast<Dict>(root.get())->get("jobs")
+                                                              : nullptr);
+  if (!jobs) {
+    fxSetAsideJobsFile(path, "is unreadable");
+    return;
+  }
+  fxJobsFileWritten = text;
+  size_t restored = 0, failed = 0;
+  for (auto& elem : *jobs) {
+    const auto* entry = downcast<Dict>(elem);
+    const auto* gidStr = entry ? downcast<String>(entry->get("gid")) : nullptr;
+    const auto* params = entry ? downcast<List>(entry->get("params")) : nullptr;
+    a2_gid_t gid = 0;
+    if (!gidStr || !params || GroupId::toNumericId(gid, gidStr->s().c_str()) != 0) {
+      ++failed;
+      continue;
+    }
+    try {
+      FxplayerAddMergeRpcMethod().addJob(params, e, gid);
+      ++restored;
+    }
+    catch (std::exception& ex) { // RecoverableException, or anything else one bad entry throws: skip just it
+      ++failed;
+      A2_LOG_ERROR(fmt("[fxmerge] could not restore job %s: %s", gidStr->s().c_str(), ex.what()));
+    }
+  }
+  if (restored + failed > 0) {
+    A2_LOG_WARN(fmt("[fxmerge] restored %lu job(s) from %s (%lu failed)", static_cast<unsigned long>(restored),
+                    path.c_str(), static_cast<unsigned long>(failed)));
+  }
+}
+
+int fxTelegramFailCode(fxtg::Result result)
+{
+  switch (result) {
+  case fxtg::Result::UNAVAILABLE:
+    return FX_MERGE_ERR_TG_UNAVAILABLE;
+  case fxtg::Result::NOT_AUTHORIZED:
+    return FX_MERGE_ERR_TG_NOT_AUTHORIZED;
+  default:
+    return FX_MERGE_ERR_TG_FAILED;
+  }
+}
+} // namespace
+
+void fxTick(DownloadEngine* e)
+{
+  std::lock_guard<std::recursive_mutex> lock(fxMergeMutex);
+  static bool restored = false;
+  const auto jobsFile = fxJobsFilePath(e);
+  if (!restored) {
+    restored = true;
+    if (!jobsFile.empty()) {
+      fxRestoreJobs(jobsFile, e);
+    }
+  }
+
+  fxtg::tick();
+  for (auto& ev : fxtg::takeEvents()) {
+    auto itr = fxMergeJobs.find(ev.gid);
+    if (itr == fxMergeJobs.end() || !itr->second.telegram) {
+      continue; // erased meanwhile (its cleanup already discarded TDLib's copy)
+    }
+    auto& job = itr->second;
+    if (ev.result == fxtg::Result::OK) {
+      // The merge's part file goes in tmpDir (an HTTP job's segments create it), next to the message marker.
+      job.segmentPaths = {ev.path};
+      job.childPath[ev.gid] = ev.path;
+      job.finishedSize[ev.gid] = ev.size;
+      fxWriteTelegramMarker(job);
+      fxMergeOnChildReported(job, ev.gid, ev.gid, true, 0, "", 0, e);
+    }
+    else {
+      fxMergeOnChildReported(job, ev.gid, ev.gid, false, fxTelegramFailCode(ev.result),
+                             "telegram: " + ev.message, static_cast<int>(ev.result), e);
+      if (fxKeptSegments(job) && ev.downloaded > 0) {
+        fxWriteTelegramMarker(job); // TDLib keeps the partial file for the next attempt
+      }
+    }
+  }
+  // A published Telegram video: TDLib's copy was the merge's input; delete it and TDLib's record of it.
+  for (auto& kv : fxMergeJobs) {
+    auto& job = kv.second;
+    if (job.telegram && job.state == FX_MERGE_MERGED && !job.tgReleased) {
+      job.tgReleased = true;
+      fxReleaseTelegramCopy(job);
+    }
+  }
+  // Not while shutting down: aria2 halts every download on its way out, which fails the running jobs -- recording
+  // that would drop exactly the jobs the file exists to bring back.
+  if (!jobsFile.empty() && !e->isHaltRequested()) {
+    fxPersistJobs(jobsFile);
+  }
 }
 
 namespace {
@@ -3544,6 +4055,10 @@ std::unique_ptr<ValueBase> removeDownload(const RpcRequest& req,
     job.requestCancel();
 
     bool touched = false;
+    if (job.telegram && !job.childDone[job.parentGid]) {
+      fxtg::stop(job.parentGid); // reports CANCELED on the next tick, like a halted segment
+      touched = true;
+    }
     for (auto childGid : job.childGids) {
       auto child = e->getRequestGroupMan()->findGroup(childGid);
       if (!child) {
@@ -4249,76 +4764,109 @@ void gatherFxMergeStatus(Dict* entryDict, FxMergeJob& job,
   std::vector<int64_t> segmentSizeSamples;
   int64_t firstSegmentSample = 0;
 
-  for (auto gid : job.childGids) {
-    int64_t childTotalLength = 0;
-    int64_t childCompletedLength = 0;
-    auto group = e->getRequestGroupMan()->findGroup(gid);
-    if (group) {
-      childTotalLength = group->getTotalLength();
-      childCompletedLength = group->getCompletedLength();
-      totalLength += childTotalLength;
-      completedLength += childCompletedLength;
-      downloadSpeed += group->calculateStat().downloadSpeed;
-    }
-    else {
-      auto dr = e->getRequestGroupMan()->findDownloadResult(gid);
-      if (dr) {
-        childTotalLength = dr->totalLength;
-        childCompletedLength = dr->completedLength;
-        totalLength += childTotalLength;
-        completedLength += childCompletedLength;
-      }
-    }
-
-    // Only a child still running has its file stat()ed; a finished one's size is looked up once and kept
-    // (2026-11-14: every segment file was stat()ed on every poll, on the main thread).
-    auto childFileSize = [&job, gid]() -> int64_t {
-      const auto childPathItr = job.childPath.find(gid);
-      return childPathItr == job.childPath.end() ? 0 : File(childPathItr->second).size();
-    };
-
+  if (job.telegram) {
+    // The one child is FxTelegram's download (no RequestGroup). Once done, its size is the file's.
+    const auto gid = job.parentGid;
     auto doneItr = job.childDone.find(gid);
+    auto sizeItr = job.finishedSize.find(gid);
     if (doneItr != job.childDone.end() && doneItr->second) {
-      auto okItr = job.childOK.find(gid);
-      if (okItr != job.childOK.end() && okItr->second) {
+      if (job.childOK[gid]) {
         ++completed;
-        auto sizeItr = job.finishedSize.find(gid);
-        if (sizeItr == job.finishedSize.end()) {
-          const int64_t observedProgress = std::max<int64_t>(childCompletedLength, childFileSize());
-          sizeItr = job.finishedSize
-                        .emplace(gid, std::max<int64_t>(observedProgress,
-                                                        std::max<int64_t>(childTotalLength, childCompletedLength)))
-                        .first;
-        }
-        const int64_t finishedSize = sizeItr->second;
-        if (finishedSize > 0) {
-          finishedBytes += finishedSize;
-          segmentSizeSamples.push_back(finishedSize);
-          if (gid == job.parentGid) {
-            firstSegmentSample = finishedSize;
-          }
-        }
+        totalLength = completedLength = sizeItr != job.finishedSize.end() ? sizeItr->second : job.tgExpectedSize;
       }
       else {
         ++failed;
+        totalLength = job.tgExpectedSize;
       }
     }
     else {
       ++active;
-      const int64_t observedProgress = std::max<int64_t>(childCompletedLength, childFileSize());
-      // `group` (found above, before this branch) is the same RequestGroup either way — STATE_WAITING
-      // means it's sitting in RequestGroupMan's reserved-groups queue, not yet admitted (see this
-      // function's own `waiting` doc comment above for why the app needs this distinction).
-      if (group && group->getState() == RequestGroup::STATE_WAITING) {
-        ++waiting;
+      fxtg::Progress p;
+      if (fxtg::progress(gid, p)) {
+        completedLength = p.downloaded;
+        totalLength = p.total > 0 ? p.total : job.tgExpectedSize;
+        downloadSpeed = p.speed;
+        if (p.queued) {
+          ++waiting;
+        }
       }
-      if (observedProgress > 0) {
-        activeBytes += observedProgress;
+      else {
+        totalLength = job.tgExpectedSize;
       }
-      if (childTotalLength > 0) {
-        segmentSizeSamples.push_back(childTotalLength);
-        if (gid == job.parentGid && firstSegmentSample == 0) {
-          firstSegmentSample = childTotalLength;
+    }
+  }
+  else {
+    for (auto gid : job.childGids) {
+      int64_t childTotalLength = 0;
+      int64_t childCompletedLength = 0;
+      auto group = e->getRequestGroupMan()->findGroup(gid);
+      if (group) {
+        childTotalLength = group->getTotalLength();
+        childCompletedLength = group->getCompletedLength();
+        totalLength += childTotalLength;
+        completedLength += childCompletedLength;
+        downloadSpeed += group->calculateStat().downloadSpeed;
+      }
+      else {
+        auto dr = e->getRequestGroupMan()->findDownloadResult(gid);
+        if (dr) {
+          childTotalLength = dr->totalLength;
+          childCompletedLength = dr->completedLength;
+          totalLength += childTotalLength;
+          completedLength += childCompletedLength;
+        }
+      }
+
+      // Only a child still running has its file stat()ed; a finished one's size is looked up once and kept
+      // (2026-11-14: every segment file was stat()ed on every poll, on the main thread).
+      auto childFileSize = [&job, gid]() -> int64_t {
+        const auto childPathItr = job.childPath.find(gid);
+        return childPathItr == job.childPath.end() ? 0 : File(childPathItr->second).size();
+      };
+
+      auto doneItr = job.childDone.find(gid);
+      if (doneItr != job.childDone.end() && doneItr->second) {
+        auto okItr = job.childOK.find(gid);
+        if (okItr != job.childOK.end() && okItr->second) {
+          ++completed;
+          auto sizeItr = job.finishedSize.find(gid);
+          if (sizeItr == job.finishedSize.end()) {
+            const int64_t observedProgress = std::max<int64_t>(childCompletedLength, childFileSize());
+            sizeItr = job.finishedSize
+                          .emplace(gid, std::max<int64_t>(observedProgress,
+                                                          std::max<int64_t>(childTotalLength, childCompletedLength)))
+                          .first;
+          }
+          const int64_t finishedSize = sizeItr->second;
+          if (finishedSize > 0) {
+            finishedBytes += finishedSize;
+            segmentSizeSamples.push_back(finishedSize);
+            if (gid == job.parentGid) {
+              firstSegmentSample = finishedSize;
+            }
+          }
+        }
+        else {
+          ++failed;
+        }
+      }
+      else {
+        ++active;
+        const int64_t observedProgress = std::max<int64_t>(childCompletedLength, childFileSize());
+        // `group` (found above, before this branch) is the same RequestGroup either way — STATE_WAITING
+        // means it's sitting in RequestGroupMan's reserved-groups queue, not yet admitted (see this
+        // function's own `waiting` doc comment above for why the app needs this distinction).
+        if (group && group->getState() == RequestGroup::STATE_WAITING) {
+          ++waiting;
+        }
+        if (observedProgress > 0) {
+          activeBytes += observedProgress;
+        }
+        if (childTotalLength > 0) {
+          segmentSizeSamples.push_back(childTotalLength);
+          if (gid == job.parentGid && firstSegmentSample == 0) {
+            firstSegmentSample = childTotalLength;
+          }
         }
       }
     }
@@ -4371,6 +4919,9 @@ void gatherFxMergeStatus(Dict* entryDict, FxMergeJob& job,
     estimatedDownloadProgress =
         (static_cast<double>(completed) + (0.5 * static_cast<double>(transferring))) /
         static_cast<double>(job.childGids.size());
+  }
+  if (job.telegram) {
+    estimatedDownloadProgress = downloadProgress; // byte-exact: TDLib knows the file's size
   }
   if (estimatedDownloadProgress < 0.0) {
     estimatedDownloadProgress = 0.0;

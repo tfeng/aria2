@@ -97,6 +97,16 @@ AC_ARG_WITH([brotli-impersonate],
                   same as --with-boringssl-impersonate above.]),
   [with_brotli_impersonate=$withval], [with_brotli_impersonate=no])
 
+AC_ARG_WITH([tdlib],
+  AS_HELP_STRING([--with-tdlib[=DIR]],
+                 [FXPlayer Telegram downloads: install the Telegram helper DIR/bin/aria2c-tg (built against TDLib
+                  by ./fetch-tdlib-deps.sh, see INSTALL.fxplayer) next to aria2c on make install. DIR is optional,
+                  defaulting to deps/tdlib, the location the script populates. With the flag, configure fails when
+                  the helper isn't built; without it, make install installs the helper if it is there and says so
+                  if not; --without-tdlib never installs it. The helper is a separate program (TDLib needs
+                  OpenSSL, aria2c links BoringSSL), so aria2c itself builds the same either way.]),
+  [with_tdlib=$withval], [with_tdlib=check])
+
 AC_ARG_WITH([ca-bundle],
   AS_HELP_STRING([--with-ca-bundle=FILE],[Use FILE as default CA bundle.]),
   [AC_DEFINE_UNQUOTED([CA_BUNDLE], ["$withval"], [Define to choose default CA bundle.])
@@ -401,6 +411,23 @@ if test "x$with_wintls" = "xyes"; then
     fi
   fi
 fi
+
+# FXPlayer: the Telegram helper (--with-tdlib). Only decides what make install does (Makefile.am's
+# install-exec-local); the helper is built by fetch-tdlib-deps.sh (CMake, about an hour), not by make.
+FX_TDLIB_HELPER=
+fx_tdlib_required=no
+case "x$with_tdlib" in
+  xno) ;;
+  xcheck) FX_TDLIB_HELPER="$(cd "$srcdir" && pwd)/deps/tdlib/bin/aria2c-tg" ;;
+  xyes) FX_TDLIB_HELPER="$(cd "$srcdir" && pwd)/deps/tdlib/bin/aria2c-tg"; fx_tdlib_required=yes ;;
+  *) fx_tdlib_dir="$(cd "$with_tdlib" 2>/dev/null && pwd)"
+     FX_TDLIB_HELPER="${fx_tdlib_dir:-$with_tdlib}/bin/aria2c-tg"; fx_tdlib_required=yes ;;
+esac
+if test "x$fx_tdlib_required" = "xyes" && test ! -x "$FX_TDLIB_HELPER"; then
+  AC_MSG_ERROR([--with-tdlib: $FX_TDLIB_HELPER is not built (run ./fetch-tdlib-deps.sh, or pass --with-tdlib=DIR)])
+fi
+AC_SUBST([FX_TDLIB_HELPER])
+AC_SUBST([fx_tdlib_required])
 
 have_boringssl_impersonate=no
 if test "x$with_boringssl_impersonate" != "xno" && test "x$have_ssl" != "xyes"; then
@@ -1217,4 +1244,5 @@ WebSocket:      $enable_websocket (CFLAGS='$WSLAY_CFLAGS' LIBS='$WSLAY_LIBS')
 Libaria2:       $enable_libaria2 (shared=${enable_shared} static=${enable_static})
 bash_completion dir: $bashcompletiondir
 Static build:   $ARIA2_STATIC
+Telegram helper: ${FX_TDLIB_HELPER:-none} (required=$fx_tdlib_required)
 ])

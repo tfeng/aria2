@@ -396,6 +396,11 @@ extern PrefPtr PREF_FX_COOKIES;
 // this, e.g. XHamster/FapHouse) preserves the pre-existing no-restriction behavior.
 // value: string (see prefs.h for the encoding)
 extern PrefPtr PREF_FX_ALLOWED_HOST_SUFFIXES;
+// FXPlayer extension (2026-11-14): Telegram jobs' helper binary (aria2c-tg) and its data directory (FxTelegram.h),
+// and the file unfinished fxplayer.addMerge jobs are kept in across restarts (rpc::fxTick).
+extern PrefPtr PREF_FX_TELEGRAM_HELPER;
+extern PrefPtr PREF_FX_TELEGRAM_DIR;
+extern PrefPtr PREF_FX_JOBS_FILE;
 // value: string that your file system recognizes as a file name.
 extern PrefPtr PREF_CERTIFICATE;
 // value: string that your file system recognizes as a file name.

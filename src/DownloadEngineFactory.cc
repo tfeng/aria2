@@ -49,6 +49,8 @@
 #include "FileAllocationDispatcherCommand.h"
 #include "AutoSaveCommand.h"
 #include "SaveSessionCommand.h"
+#include "FxTickCommand.h"
+#include "FxTelegram.h"
 #include "HaveEraseCommand.h"
 #include "TimedHaltCommand.h"
 #include "WatchProcessCommand.h"
@@ -181,6 +183,12 @@ std::unique_ptr<DownloadEngine> DownloadEngineFactory::newDownloadEngine(
   }
   e->addRoutineCommand(
       make_unique<HaveEraseCommand>(e->newCUID(), e.get(), 10_s));
+  // FXPlayer (2026-11-14): the jobs file and Telegram downloads -- both only for the RPC daemon (a one-off aria2c run
+  // with the same config must not pick up the daemon's jobs).
+  if (op->getAsBool(PREF_ENABLE_RPC)) {
+    fxtg::configure(op->get(PREF_FX_TELEGRAM_HELPER), op->get(PREF_FX_TELEGRAM_DIR));
+    e->addRoutineCommand(make_unique<FxTickCommand>(e->newCUID(), e.get()));
+  }
   {
     auto stopSec = op->getAsInt(PREF_STOP);
     if (stopSec > 0) {

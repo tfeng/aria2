@@ -210,6 +210,8 @@ SRCS =  \
 	RpcMethod.cc RpcMethod.h\
 	RpcMethodFactory.cc RpcMethodFactory.h\
 	RpcMethodImpl.cc RpcMethodImpl.h\
+	FxTelegram.cc FxTelegram.h\
+	FxTickCommand.cc FxTickCommand.h\
 	RpcRequest.cc RpcRequest.h\
 	RpcResponse.cc RpcResponse.h\
 	rpc_helper.cc rpc_helper.h\

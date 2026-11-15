@@ -15,8 +15,9 @@ Normal build (fresh checkout)
 
     git clone <this fork's URL> aria2 && cd aria2
     ./fetch-curl-impersonate-deps.sh
+    ./fetch-tdlib-deps.sh                     # optional: Telegram downloads (see below)
     autoreconf -fi
-    ./configure --with-boringssl-impersonate --with-brotli-impersonate --without-gnutls
+    ./configure --with-boringssl-impersonate --with-brotli-impersonate --without-gnutls [--with-tdlib]
     make -j$(nproc)
 
 No manual dependency setup and no assumption of any pre-existing local checkout of curl-impersonate
@@ -24,7 +25,7 @@ anywhere on the machine.
 
 fetch-curl-impersonate-deps.sh (repo root) builds the two vendored dependencies
 --with-boringssl-impersonate/--with-brotli-impersonate need: a patched BoringSSL carrying Chrome 116's
-TLS profile, and brotli for its certificate-compression extension. It shallow-clones
+TLS profile, and brotli for its certificate-compression extension. It shallow-fetches
 lwthiker/curl-impersonate at a pinned commit into a gitignored scratch dir (build/curl-impersonate-src/)
 -- used READ-ONLY, purely as a source of its own official patches and Makefile targets, never modified --
 and drives that project's own `make` targets for just these two library sets (curl-impersonate's Makefile
@@ -33,8 +34,8 @@ of it). curl-impersonate's own curl/nghttp2 are deliberately NOT built -- aria2 
 and only borrows curl-impersonate's TLS backend + brotli decompression (src/LibsslTLSContext.cc,
 src/LibsslTLSSession.cc). Output lands at deps/boringssl-impersonate/{lib,include}/ and
 deps/brotli-impersonate/{lib,include}/ -- gitignored, and exactly the shape configure.ac expects.
-Idempotent (a stamp file keyed on the pinned commit skips rebuilding on a second run); pass --force to
-rebuild anyway.
+Idempotent (a stamp file keyed on the pinned commit, deps/boringssl-impersonate/.built-<sha>, skips rebuilding
+on a second run); pass --force to re-fetch and rebuild anyway.
 
 --with-boringssl-impersonate/--with-brotli-impersonate accept a bare flag (no =DIR) that defaults to
 deps/boringssl-impersonate / deps/brotli-impersonate respectively -- the exact paths the fetch script
@@ -48,6 +49,89 @@ already present and current for your checkout (e.g. a release tarball ships a pr
 running it is always safe either way, just occasionally unnecessary.
 
 
+Telegram downloads (optional)
+==============================
+
+fxplayer.addMerge also takes a Telegram message as its source -- one segment, {"telegram": {"chatId", "msgId",
+"size"?}} -- downloaded by TDLib and then remuxed (+faststart), probed and published like any other save. aria2c
+can't link TDLib itself (it links the BoringSSL above; TDLib needs OpenSSL, and the two export the same symbols),
+so TDLib runs in a small helper, aria2c-tg (tg-helper/), that only relays TDLib's JSON interface over a pipe.
+aria2c starts it with the RPC daemon, restarts it when it exits, and closes it on shutdown (TDLib saves its state;
+the helper also closes cleanly on SIGTERM, e.g. when systemd stops the service).
+
+Build and install:
+
+    sudo apt install gperf libssl-dev zlib1g-dev     # TDLib's build needs these (plus git/cmake/make/a C++17 compiler)
+    ./fetch-tdlib-deps.sh                            # first build takes about an hour on a Raspberry Pi 5
+    ./configure --with-boringssl-impersonate --with-brotli-impersonate --without-gnutls --with-tdlib
+    make -j$(nproc)
+    sudo make install                                # aria2c and aria2c-tg -> /usr/local/bin
+
+fetch-tdlib-deps.sh follows fetch-curl-impersonate-deps.sh's conventions: it pins a TDLib commit (TDLIB_SHA),
+shallow-fetches just that commit into build/tdlib-src/ (gitignored, never modified), builds the helper with CMake
+in build/tg-helper-build/ and installs it as deps/tdlib/bin/aria2c-tg with a stamp file deps/tdlib/.built-<sha>.
+A second run is a no-op; an edited tg-helper/ source is rebuilt incrementally (seconds). --force re-fetches and
+rebuilds everything; JOBS=N overrides the default -j2 (TDLib's largest files need about 3 GB of memory each to
+compile). TDLib has no regular release tags; its own docs build master. To update:
+
+    ./fetch-tdlib-deps.sh --bump    # pins upstream's current master in the script, then builds it
+    git diff fetch-tdlib-deps.sh    # review, then commit the new pin
+    sudo make install               # (or install -m 0755 deps/tdlib/bin/aria2c-tg /usr/local/bin/) + restart aria2
+
+--with-tdlib mirrors --with-boringssl-impersonate: a bare flag means deps/tdlib, =DIR another build (DIR/bin/
+aria2c-tg), and configure fails if the helper isn't there. Without the flag `make install` still installs the
+helper when it is built (and says so when it isn't); --without-tdlib never installs it. Either way the helper is
+built by the script, not by make -- it is a separate program with its own toolchain (CMake, OpenSSL) and an
+hour-long build -- and aria2c itself is the same binary with or without it.
+
+aria2.conf (both options are needed; only the RPC daemon uses them):
+
+    fx-telegram-helper=/usr/local/bin/aria2c-tg
+    fx-telegram-dir=/mnt/Downloads/.tdlib    # TDLib's database (the account's session: kept 0700), its downloads,
+                                             # the saved API ID/hash (fx-telegram.json, 0600), helper.log
+
+TDLib downloads into fx-telegram-dir/files/; ffmpeg reads the finished file from there and writes the save next to
+its output, so any filesystem works, but the directory needs room for the largest videos being saved. TDLib's
+copy is deleted once the save is published, when the message turns out to be gone (2011), and when the save is
+deleted (fxplayer.removeMergeOutput / aria2.remove) -- unless another job for the same message still needs it. A
+failed or stopped download (2012/2013, fxplayer.stopMerge) keeps TDLib's partial file and the next attempt resumes
+from it. helper.log is TDLib's own log (errors only); it is moved to helper.log.1 at a helper start once over 4 MB.
+
+Sign-in: the server's Telegram account is signed in once, from the app -- saving a Telegram group with "aria2
+offload" walks through it (fxplayer.telegramAuthState / fxplayer.telegramAuth): the app sends its API ID and
+hash, asks for a QR login ({"qr": true}; the state becomes wait-qr with a tg://login link) and confirms that link
+with its own, already signed-in TDLib. Only a two-step-verification password may then be asked (wait-password). A
+phone number + code login ({"phone"}, then {"code"}) also exists. {"logOut": true} signs the server out. While
+the account isn't signed in, Telegram jobs fail at once with 2012 (retryable; they don't wait).
+
+What the log shows (log-level=warn, all one line each, tagged [fxtg]): helper started / exited (with uptime and
+why -- an exit during shutdown or from a signal is a WARN, a crash an ERROR quoting helper.log's last line),
+sign-in state changes and submitted steps (never their values), each download's start (gid, chat, message, size,
+resume offset) and end (bytes, time, average speed; or the failure and its reason), requeues after a helper
+exit, flood waits, stalls and downloads TDLib stopped, and chat-list loading. Behaviour worth knowing:
+  - At most 3 Telegram downloads run at once; the rest show as `waiting` in tellStatus.
+  - A helper that exits is restarted after 5 s and its downloads resume. After 3 quick exits in a row restarts slow
+    to once a minute and waiting downloads fail with 2013 (e.g. a missing or broken aria2c-tg).
+  - Telegram flood waits (TDLib error 429) hold the download queued for up to 10 minutes; longer ones fail (2013).
+  - TDLib reports a failed download only as "stopped": aria2 asks again up to 3 times without progress, then fails
+    it (2013). No new byte for 10 minutes also fails it (2013, logged as stalled after 2 minutes).
+  - A chat a fresh sign-in doesn't know yet is found by loading the chat lists once (main + archive).
+
+
+Jobs file (restart recovery)
+=============================
+
+Unfinished fxplayer.addMerge jobs (web and Telegram) are kept in a jobs file and added again, under the same
+GIDs, when the daemon starts -- through the same code as a fresh submit, so each job's pacing, budget and
+per-domain settings come back with it, and its downloaded segments (or TDLib's partial file) are reused. A job
+that was merging at the restart merges again. The file defaults to fx-jobs.json next to --save-session;
+--fx-jobs-file=FILE sets another path. It holds each job's request, cookies included, so it is written with mode
+0600 (temporary file, fsync, rename), only when the set of jobs changes. Only the RPC daemon uses it. A file that
+can't be read (corrupt, or over 256 MB) is moved aside to FILE.unreadable and no jobs are restored; a single job
+that can't be added again is logged and dropped. Telegram jobs restored before the helper is up simply wait for it
+(and fail with 2012 if the account turns out not to be signed in).
+
+
 Rebuilding from scratch (clean slate)
 ========================================
 
@@ -58,9 +142,13 @@ bumping the curl-impersonate pin, or just to confirm the build is fully reproduc
     git clean -ndx                  # DRY RUN: preview what would be deleted
     git clean -fdx                  # actually delete it
     ./fetch-curl-impersonate-deps.sh
+    ./fetch-tdlib-deps.sh           # if you use Telegram downloads: about an hour again (see below)
     autoreconf -fi
-    ./configure --with-boringssl-impersonate --with-brotli-impersonate --without-gnutls
+    ./configure --with-boringssl-impersonate --with-brotli-impersonate --without-gnutls [--with-tdlib]
     make -j$(nproc)
+
+To keep the TDLib build (deps/tdlib/, build/tdlib-src/, build/tg-helper-build/), exclude it from the clean:
+git clean -fdx -e deps/tdlib -e build/tdlib-src -e build/tg-helper-build (and -n first, as above).
 
 git clean only ever removes untracked/ignored files -- it cannot touch anything committed, so your source
 edits are never at risk. The -x flag matters specifically because deps/{boringssl,brotli}-impersonate/

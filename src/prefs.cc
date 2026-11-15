@@ -417,6 +417,10 @@ PrefPtr PREF_HEADER = makePref("header");
 PrefPtr PREF_FX_COOKIES = makePref("fx-cookies");
 // value: string (see prefs.h for the encoding)
 PrefPtr PREF_FX_ALLOWED_HOST_SUFFIXES = makePref("fx-allowed-host-suffixes");
+// FXPlayer extension (2026-11-14): see FxTelegram.h and rpc::fxTick.
+PrefPtr PREF_FX_TELEGRAM_HELPER = makePref("fx-telegram-helper");
+PrefPtr PREF_FX_TELEGRAM_DIR = makePref("fx-telegram-dir");
+PrefPtr PREF_FX_JOBS_FILE = makePref("fx-jobs-file");
 // value: string that your file system recognizes as a file name.
 PrefPtr PREF_CERTIFICATE = makePref("certificate");
 // value: string that your file system recognizes as a file name.

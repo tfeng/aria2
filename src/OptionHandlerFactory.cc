@@ -659,6 +659,26 @@ std::vector<OptionHandler*> OptionHandlerFactory::createOptionHandlers()
     handlers.push_back(op);
   }
   {
+    OptionHandler* op(new LocalFilePathOptionHandler(PREF_FX_TELEGRAM_HELPER, TEXT_FX_TELEGRAM_HELPER,
+                                                     NO_DEFAULT_VALUE, /* acceptStdin = */ false, 0,
+                                                     /* mustExist = */ false));
+    op->addTag(TAG_ADVANCED);
+    handlers.push_back(op);
+  }
+  {
+    OptionHandler* op(new LocalFilePathOptionHandler(PREF_FX_TELEGRAM_DIR, TEXT_FX_TELEGRAM_DIR,
+                                                     NO_DEFAULT_VALUE, /* acceptStdin = */ false, 0,
+                                                     /* mustExist = */ false));
+    op->addTag(TAG_ADVANCED);
+    handlers.push_back(op);
+  }
+  {
+    OptionHandler* op(new LocalFilePathOptionHandler(PREF_FX_JOBS_FILE, TEXT_FX_JOBS_FILE, NO_DEFAULT_VALUE,
+                                                     /* acceptStdin = */ false, 0, /* mustExist = */ false));
+    op->addTag(TAG_ADVANCED);
+    handlers.push_back(op);
+  }
+  {
     OptionHandler* op(new LocalFilePathOptionHandler(
         PREF_SAVE_SESSION, TEXT_SAVE_SESSION, NO_DEFAULT_VALUE,
         /* acceptStdin = */ false, 0, /* mustExist = */ false));

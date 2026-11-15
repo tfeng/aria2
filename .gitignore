@@ -49,3 +49,6 @@ compile
 main.log
 main.trs
 test-suite.log
+
+# fetch-tdlib-deps.sh output (TDLib clone, helper build, helper binary); not committed.
+/deps/tdlib/

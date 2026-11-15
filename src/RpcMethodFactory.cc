@@ -60,6 +60,8 @@ std::vector<std::string> rpcMethodNames = {
   "fxplayer.reportVolume",
   "fxplayer.stopMerge",
   "fxplayer.removeMergeOutput",
+  "fxplayer.telegramAuthState",
+  "fxplayer.telegramAuth",
 #ifdef ENABLE_BITTORRENT
     "aria2.addTorrent",
     "aria2.getPeers",
@@ -157,6 +159,12 @@ std::unique_ptr<RpcMethod> createMethod(const std::string& methodName)
 
   if (methodName == FxplayerRemoveMergeOutputRpcMethod::getMethodName()) {
     return make_unique<FxplayerRemoveMergeOutputRpcMethod>();
+  }
+  if (methodName == FxplayerTelegramAuthStateRpcMethod::getMethodName()) {
+    return make_unique<FxplayerTelegramAuthStateRpcMethod>();
+  }
+  if (methodName == FxplayerTelegramAuthRpcMethod::getMethodName()) {
+    return make_unique<FxplayerTelegramAuthRpcMethod>();
   }
 
 #ifdef ENABLE_BITTORRENT

@@ -736,6 +736,19 @@
     "                              header and inflate response if remote server\n" \
     "                              responds with 'Content-Encoding: gzip' or\n"  \
     "                              'Content-Encoding: deflate'.")
+#define TEXT_FX_TELEGRAM_HELPER                                         \
+  _(" --fx-telegram-helper=FILE    FXPlayer: path of aria2c-tg (built by\n"  \
+    "                              fetch-tdlib-deps.sh). Enables Telegram\n"   \
+    "                              sources in fxplayer.addMerge.")
+#define TEXT_FX_TELEGRAM_DIR                                            \
+  _(" --fx-telegram-dir=DIR        FXPlayer: TDLib's database, its downloads\n" \
+    "                              (partial and complete) and the API\n"       \
+    "                              credentials. Needs room for the largest\n"  \
+    "                              videos being saved.")
+#define TEXT_FX_JOBS_FILE                                               \
+  _(" --fx-jobs-file=FILE          FXPlayer: unfinished fxplayer.addMerge jobs,\n" \
+    "                              added again at startup. Default: fx-jobs.json\n" \
+    "                              next to --save-session.")
 #define TEXT_SAVE_SESSION                       \
   _(" --save-session=FILE          Save error/unfinished downloads to FILE on exit.\n" \
     "                              You can pass this output file to aria2c with -i\n" \

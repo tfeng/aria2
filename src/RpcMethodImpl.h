@@ -143,6 +143,9 @@ protected:
 
 public:
   static const char* getMethodName() { return "fxplayer.addMerge"; }
+  // The RPC's implementation for one request's params (token already stripped); `restoreGid` != 0 re-adds a job from
+  // the jobs file under its old GID (rpc::fxTick). Returns the job's GID; throws like the RPC.
+  a2_gid_t addJob(const List* params, DownloadEngine* e, a2_gid_t restoreGid);
 };
 
 class FxplayerRetryMergeRpcMethod : public RpcMethod {
@@ -220,6 +223,29 @@ protected:
 
 public:
   static const char* getMethodName() { return "fxplayer.removeMergeOutput"; }
+};
+
+// FXPlayer extension (2026-11-14): fxplayer.telegramAuthState() -> {configured, state, detail?, error?} -- the
+// sign-in state of the server's Telegram account (FxTelegram.h), for Telegram jobs.
+class FxplayerTelegramAuthStateRpcMethod : public RpcMethod {
+protected:
+  virtual std::unique_ptr<ValueBase> process(const RpcRequest& req,
+                                             DownloadEngine* e) CXX11_OVERRIDE;
+
+public:
+  static const char* getMethodName() { return "fxplayer.telegramAuthState"; }
+};
+
+// FXPlayer extension (2026-11-14): fxplayer.telegramAuth({apiId+apiHash | phone | qr | code | password | logOut}) -- one
+// sign-in step; answers with the state like telegramAuthState (TDLib answers asynchronously: poll that for the
+// next state).
+class FxplayerTelegramAuthRpcMethod : public RpcMethod {
+protected:
+  virtual std::unique_ptr<ValueBase> process(const RpcRequest& req,
+                                             DownloadEngine* e) CXX11_OVERRIDE;
+
+public:
+  static const char* getMethodName() { return "fxplayer.telegramAuth"; }
 };
 
 class RemoveRpcMethod : public RpcMethod {
@@ -677,6 +703,11 @@ bool fxIsMergeChild(a2_gid_t gid);
 // FXPlayer extension (2026-11-14): `gid` no longer has a RequestGroup or DownloadResult that could be serialized (its
 // result was evicted/removed, or it was dropped from the queue): forget it, so fxIsMergeChild's set stays bounded.
 void fxForgetMergeChild(a2_gid_t gid);
+
+// FXPlayer extension (2026-11-14): FxTickCommand calls this about once a second on the main thread: restores the
+// jobs file's jobs on the first call, collects Telegram downloads' results, and rewrites the jobs file when the set
+// of running jobs changed.
+void fxTick(DownloadEngine* e);
 
 } // namespace rpc
 
